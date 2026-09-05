@@ -1,0 +1,96 @@
+name: "Publish Release"
+description: "タグ・GitHub Release 作成とリリースブランチ削除を行う共通 Composite Action"
+
+inputs:
+  branch:
+    description: "マージされたリリースブランチ名 (e.g. release/v1.3.0)"
+    required: true
+  pr-body:
+    description: "PR のボディ (リリースノート)"
+    required: true
+  update-major-tag:
+    description: "メジャーバージョンタグを更新するか (true/false)"
+    default: "false"
+  github-token:
+    description: "contents:write 権限の PAT"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.github-token }}
+        fetch-tags: true
+
+    - name: Validate branch format
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        if ! echo "$BRANCH" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::branch must match release/vX.Y.Z format (got: ${BRANCH})"
+          exit 1
+        fi
+
+    - name: Extract version from branch name
+      id: version
+      shell: bash
+      env:
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        VERSION="${BRANCH#release/}"
+        echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "major=v$(echo ${VERSION#v} | cut -d. -f1)" >> "$GITHUB_OUTPUT"
+
+    - name: Create tag and push
+      shell: bash
+      env:
+        TAG: ${{ steps.version.outputs.tag }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+          git tag "$TAG"
+          git push origin "$TAG"
+        else
+          echo "Tag ${TAG} already exists, skipping."
+        fi
+
+    - name: Create GitHub Release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TAG: ${{ steps.version.outputs.tag }}
+        BODY: ${{ inputs.pr-body }}
+      run: |
+        printf '%s\n' "$BODY" > release_notes.md
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          gh release edit "$TAG" --notes-file release_notes.md
+        else
+          gh release create "$TAG" --title "$TAG" --notes-file release_notes.md
+        fi
+
+    - name: Update major version tag
+      if: inputs.update-major-tag == 'true'
+      shell: bash
+      env:
+        MAJOR: ${{ steps.version.outputs.major }}
+      run: |
+        git tag -f "$MAJOR"
+        git push origin "$MAJOR" --force
+
+    - name: Delete release branch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        if ! ERROR=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" 2>&1); then
+          if echo "$ERROR" | grep -q "Not Found\|Reference does not exist"; then
+            echo "Branch already deleted, skipping."
+          else
+            echo "::error::Failed to delete release branch: $ERROR"
+            exit 1
+          fi
+        fi
