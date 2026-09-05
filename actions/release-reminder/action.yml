@@ -18,10 +18,19 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_REF: ${{ github.event.pull_request.head.ref }}
         EVENT_ACTION: ${{ github.event.action }}
         THRESHOLD: ${{ inputs.threshold }}
       run: |
         MARKER="<!-- release-reminder-bot -->"
+
+        # リリース PR 自身にはコメントしない
+        case "$HEAD_REF" in
+          release/v*)
+            echo "Release PR ($HEAD_REF), skipping"
+            exit 0
+            ;;
+        esac
 
         LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
         if [ -z "$LAST_TAG" ]; then
