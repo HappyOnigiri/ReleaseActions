@@ -3,8 +3,13 @@ description: "リリースブランチを作成してPRを開く共通 Composite
 
 inputs:
   version:
-    description: "semver バージョン (e.g. 1.3.0)"
-    required: true
+    description: "semver バージョン (e.g. 1.3.0)。bump と同時には指定できない"
+    required: false
+    default: ""
+  bump:
+    description: "バージョンの上げ方: none / auto / major / minor / patch。none 以外を指定した場合は version を指定しない"
+    required: false
+    default: "none"
   version-bump-type:
     description: "バージョンバンプ方法: npm / python / pyproject / xcodegen / none"
     default: "none"
@@ -31,15 +36,42 @@ inputs:
     description: "contents:write + pull-requests:write 権限の PAT"
     required: true
 
+outputs:
+  version:
+    description: "実際にリリースするバージョン (bump 指定時は算出結果)"
+    value: ${{ steps.resolve.outputs.version }}
+
 runs:
   using: "composite"
   steps:
-    - name: Validate version format
+    - name: Validate inputs
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
+        BUMP: ${{ inputs.bump }}
+        BUMP_TYPE: ${{ inputs.version-bump-type }}
       run: |
-        if ! echo "$VERSION" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+        case "$BUMP" in
+          none|auto|major|minor|patch) ;;
+          *) echo "::error::bump must be none, auto, major, minor, or patch (got: ${BUMP})"; exit 1 ;;
+        esac
+
+        case "$BUMP_TYPE" in
+          npm|python|pyproject|xcodegen|none) ;;
+          *) echo "::error::version-bump-type must be npm, python, pyproject, xcodegen, or none (got: ${BUMP_TYPE})"; exit 1 ;;
+        esac
+
+        if [ -n "$VERSION" ] && [ "$BUMP" != "none" ]; then
+          echo "::error::version と bump は同時に指定できません (version=${VERSION}, bump=${BUMP})"
+          exit 1
+        fi
+
+        if [ -z "$VERSION" ] && [ "$BUMP" = "none" ]; then
+          echo "::error::version と bump のいずれかを指定してください"
+          exit 1
+        fi
+
+        if [ -n "$VERSION" ] && ! echo "$VERSION" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
           echo "::error::Version must be in semver format (e.g. 1.3.0)"
           exit 1
         fi
@@ -50,10 +82,140 @@ runs:
         fetch-depth: 0
         token: ${{ inputs.github-token }}
 
-    - name: Check tag does not already exist
+    - name: Resolve version
+      id: resolve
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
+        BUMP: ${{ inputs.bump }}
+        BUMP_TYPE: ${{ inputs.version-bump-type }}
+        PYTHON_VERSION_FILE: ${{ inputs.python-version-file }}
+        PYPROJECT_PATH: ${{ inputs.pyproject-path }}
+        XCODEGEN_VERSION_FILE: ${{ inputs.xcodegen-version-file }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+
+        if [ -n "$VERSION" ]; then
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "### Release version: \`${VERSION}\` (明示指定)" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        # 現在のバージョンを version-bump-type ごとの真実源から取得する。
+        # bump-type が none のリポジトリはバージョンを持つファイルが無いため最新タグを使う。
+        case "$BUMP_TYPE" in
+          npm)
+            CURRENT=$([ -f package.json ] && jq -r '.version // ""' package.json || echo "")
+            SOURCE="package.json"
+            ;;
+          python)
+            CURRENT=$([ -f "$PYTHON_VERSION_FILE" ] && sed -n 's/^__version__ = "\(.*\)"/\1/p' "$PYTHON_VERSION_FILE" | head -1 || echo "")
+            SOURCE="$PYTHON_VERSION_FILE"
+            ;;
+          pyproject)
+            CURRENT=$([ -f "$PYPROJECT_PATH" ] && sed -n 's/^version = "\(.*\)"/\1/p' "$PYPROJECT_PATH" | head -1 || echo "")
+            SOURCE="$PYPROJECT_PATH"
+            ;;
+          xcodegen)
+            CURRENT=$([ -f "$XCODEGEN_VERSION_FILE" ] && sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' "$XCODEGEN_VERSION_FILE" | head -1 || echo "")
+            SOURCE="$XCODEGEN_VERSION_FILE"
+            ;;
+          none)
+            CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            CURRENT="${CURRENT#v}"
+            SOURCE="最新タグ"
+            ;;
+        esac
+
+        if ! echo "$CURRENT" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+          echo "::error::現在のバージョンを semver として取得できませんでした (source=${SOURCE}, 取得値='${CURRENT}')。version を明示指定してください"
+          exit 1
+        fi
+
+        BUMP_KIND="$BUMP"
+        REASON="bump=${BUMP} の明示指定"
+
+        if [ "$BUMP_KIND" = "auto" ]; then
+          LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            echo "::error::GitHub Release が存在しないため auto 判定できません。version または bump を明示指定してください"
+            exit 1
+          fi
+          LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
+
+          # 判定対象は前回リリース以降にマージされた PR のタイトル。
+          # changelog の分類 (release-changelog-builder-action) と同じ規約に揃えている。
+          # 自分自身のリリース PR (release: vX.Y.Z) は対象から除外する。
+          PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
+            --search "merged:>=${LAST_DATE}" --limit 200 --json number,title,body \
+            | jq '[.[] | select(.title | test("^release(\\(.+\\))?!?:") | not)]')
+
+          if [ "$(echo "$PR_JSON" | jq 'length')" -eq 0 ]; then
+            echo "::error::前回リリース ${LAST_TAG} 以降にマージされた PR が無いため auto 判定できません"
+            exit 1
+          fi
+
+          BREAKING=$(echo "$PR_JSON" | jq -r '
+            .[] | select((.title | test("^[a-z]+(\\(.+\\))?!:")) or ((.body // "") | test("(^|\n)BREAKING CHANGE:")))
+            | "- #\(.number) \(.title)"')
+          if [ -n "$BREAKING" ]; then
+            echo "::error::breaking change を含む PR を検出しました。major は自動判定しません。bump=major または version を明示指定してください"
+            {
+              echo "### auto 判定に失敗しました"
+              echo ""
+              echo "breaking change を含む PR を検出しました。major は自動では上げません。"
+              echo ""
+              echo "$BREAKING"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          FEATS=$(echo "$PR_JSON" | jq -r '.[] | select(.title | test("^feat(\\(.+\\))?:")) | "- #\(.number) \(.title)"')
+          PATCHES=$(echo "$PR_JSON" | jq -r '.[] | select(.title | test("^(fix|perf|refactor|chore|ci|docs|build|style|test)(\\(.+\\))?:")) | "- #\(.number) \(.title)"')
+
+          if [ -n "$FEATS" ]; then
+            BUMP_KIND="minor"
+            REASON="feat の PR を検出"
+            MATCHED="$FEATS"
+          elif [ -n "$PATCHES" ]; then
+            BUMP_KIND="patch"
+            REASON="fix / chore などの PR のみ"
+            MATCHED="$PATCHES"
+          else
+            echo "::error::前回リリース ${LAST_TAG} 以降の PR タイトルから種別を判定できませんでした。version または bump を明示指定してください"
+            exit 1
+          fi
+        fi
+
+        IFS=. read -r MAJOR MINOR PATCH <<< "$CURRENT"
+        case "$BUMP_KIND" in
+          major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+          minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+          patch) PATCH=$((PATCH + 1)) ;;
+        esac
+        NEXT="${MAJOR}.${MINOR}.${PATCH}"
+
+        echo "version=${NEXT}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Release version: \`${CURRENT}\` → \`${NEXT}\` (${BUMP_KIND})"
+          echo ""
+          echo "- 現在のバージョン取得元: ${SOURCE}"
+          echo "- 判定理由: ${REASON}"
+          if [ "$BUMP" = "auto" ]; then
+            echo ""
+            echo "<details><summary>判定対象の PR</summary>"
+            echo ""
+            echo "${MATCHED}"
+            echo ""
+            echo "</details>"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Check tag does not already exist
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
           echo "::error::Tag v${VERSION} already exists"
@@ -63,27 +225,17 @@ runs:
     - name: Create release branch
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         git checkout -b "release/v${VERSION}"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-    - name: Validate version-bump-type
-      shell: bash
-      env:
-        BUMP_TYPE: ${{ inputs.version-bump-type }}
-      run: |
-        case "$BUMP_TYPE" in
-          npm|python|pyproject|xcodegen|none) ;;
-          *) echo "::error::version-bump-type must be npm, python, pyproject, xcodegen, or none (got: ${BUMP_TYPE})"; exit 1 ;;
-        esac
-
     - name: Version bump (npm)
       if: inputs.version-bump-type == 'npm'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         npm version "$VERSION" --no-git-tag-version
         git add package.json
@@ -94,7 +246,7 @@ runs:
       if: inputs.version-bump-type == 'python'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
         VERSION_FILE: ${{ inputs.python-version-file }}
       run: |
         if [ ! -f "$VERSION_FILE" ]; then
@@ -113,7 +265,7 @@ runs:
       if: inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
         PYPROJECT_PATH: ${{ inputs.pyproject-path }}
       run: |
         if [ ! -f "$PYPROJECT_PATH" ]; then
@@ -137,7 +289,7 @@ runs:
       if: inputs.version-bump-type == 'xcodegen'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
         VERSION_FILE: ${{ inputs.xcodegen-version-file }}
       run: |
         if [ ! -f "$VERSION_FILE" ]; then
@@ -180,7 +332,7 @@ runs:
       if: inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         git commit -m "release: v${VERSION}"
 
@@ -188,14 +340,14 @@ runs:
       if: inputs.version-bump-type == 'none'
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         git commit --allow-empty -m "release: v${VERSION}"
 
     - name: Push release branch
       shell: bash
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
       run: |
         git push --force-with-lease origin "release/v${VERSION}"
 
@@ -209,7 +361,7 @@ runs:
       uses: mikepenz/release-changelog-builder-action@v5
       with:
         fromTag: ${{ steps.prev_tag.outputs.tag }}
-        toTag: release/v${{ inputs.version }}
+        toTag: release/v${{ steps.resolve.outputs.version }}
         configurationJson: |
           {
             "categories": [
@@ -249,7 +401,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ steps.resolve.outputs.version }}
         CHANGELOG: ${{ steps.changelog.outputs.changelog }}
       run: |
         printf '%s' "${CHANGELOG}" > changelog_body.txt
