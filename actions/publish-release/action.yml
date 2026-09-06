@@ -18,20 +18,64 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        BRANCH: ${{ inputs.branch }}
+        PR_BODY: ${{ inputs.pr-body }}
+        UPDATE_MAJOR_TAG: ${{ inputs.update-major-tag }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        require_token "$GITHUB_TOKEN_INPUT" "github-token" "contents:write"
+        require_commands git gh
+
+        if [ -z "$BRANCH" ]; then
+          fail "branch が空です" \
+            "リリースするバージョンをブランチ名から取り出すため、branch は必須です" \
+            "対処: 呼び出し側で \`\${{ github.event.pull_request.head.ref }}\` などを渡してください"
+        fi
+
+        if ! echo "$BRANCH" | grep -qE '^release/v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+          fail "branch '${BRANCH}' は release/vX.Y.Z の形式ではありません" \
+            "この Action はブランチ名からリリースするバージョンを取り出します" \
+            "対処: リリース PR 以外でこの Action が動いていないか、呼び出し側ワークフローの条件を確認してください"
+        fi
+
+        case "$UPDATE_MAJOR_TAG" in
+          true|false) ;;
+          *) fail "update-major-tag の値 '${UPDATE_MAJOR_TAG}' は指定できません" \
+               "指定できるのは true または false です" \
+               "対処: 呼び出し側ワークフローの update-major-tag 入力を見直してください" ;;
+        esac
+
+        if [ -z "$PR_BODY" ]; then
+          echo "::notice::pr-body が空のため、リリースノートが空の GitHub Release を作成します"
+        fi
+
+    - name: Verify token
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if ! REPO_JSON=$(gh api "repos/${GITHUB_REPOSITORY}" 2>&1); then
+          fail "github-token でリポジトリ ${GITHUB_REPOSITORY} にアクセスできません" \
+            "API の応答: $(echo "$REPO_JSON" | head -3 | tr '\n' ' ')" \
+            "トークンの期限切れ・失効、またはこのリポジトリがトークンのスコープ外である可能性があります" \
+            "対処: contents:write を持つ有効な PAT を再登録してください"
+        fi
+
     - uses: actions/checkout@v4
       with:
         token: ${{ inputs.github-token }}
         fetch-tags: true
-
-    - name: Validate branch format
-      shell: bash
-      env:
-        BRANCH: ${{ inputs.branch }}
-      run: |
-        if ! echo "$BRANCH" | grep -qE '^release/v[0-9]+\.[0-9]+\.[0-9]+$'; then
-          echo "::error::branch must match release/vX.Y.Z format (got: ${BRANCH})"
-          exit 1
-        fi
 
     - name: Extract version from branch name
       id: version
@@ -39,6 +83,7 @@ runs:
       env:
         BRANCH: ${{ inputs.branch }}
       run: |
+        set -euo pipefail
         VERSION="${BRANCH#release/}"
         echo "tag=${VERSION}" >> "$GITHUB_OUTPUT"
         echo "major=v$(echo ${VERSION#v} | cut -d. -f1)" >> "$GITHUB_OUTPUT"
@@ -46,51 +91,91 @@ runs:
     - name: Create tag and push
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         TAG: ${{ steps.version.outputs.tag }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-          git tag "$TAG"
-          git push origin "$TAG"
-        else
-          echo "Tag ${TAG} already exists, skipping."
+
+        # 再実行に備えて、既にタグがある場合は成功として扱う。
+        if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+          echo "::notice::タグ ${TAG} は既に存在するため作成をスキップします"
+          exit 0
+        fi
+
+        git tag "$TAG"
+        if ! PUSH_OUT=$(git push origin "$TAG" 2>&1); then
+          fail "タグ ${TAG} を push できませんでした" \
+            "git の出力: $(echo "$PUSH_OUT" | grep -v '^remote: *$' | tail -3 | tr '\n' ' ')" \
+            "github-token の contents:write 権限不足、またはタグ保護ルールに掛かっている可能性があります" \
+            "対処: トークンの権限と Settings → Rules のタグ保護設定を確認してください"
         fi
 
     - name: Create GitHub Release
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         TAG: ${{ steps.version.outputs.tag }}
         BODY: ${{ inputs.pr-body }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         printf '%s\n' "$BODY" > release_notes.md
         if gh release view "$TAG" >/dev/null 2>&1; then
-          gh release edit "$TAG" --notes-file release_notes.md
+          if ! RELEASE_OUT=$(gh release edit "$TAG" --notes-file release_notes.md 2>&1); then
+            fail "既存の GitHub Release ${TAG} を更新できませんでした" \
+              "gh の出力: $(echo "$RELEASE_OUT" | head -3 | tr '\n' ' ')" \
+              "対処: github-token の contents:write 権限を確認してください"
+          fi
         else
-          gh release create "$TAG" --title "$TAG" --notes-file release_notes.md
+          if ! RELEASE_OUT=$(gh release create "$TAG" --title "$TAG" --notes-file release_notes.md 2>&1); then
+            fail "GitHub Release ${TAG} を作成できませんでした" \
+              "gh の出力: $(echo "$RELEASE_OUT" | head -3 | tr '\n' ' ')" \
+              "対処: github-token の contents:write 権限と、タグ ${TAG} が push されているかを確認してください"
+          fi
         fi
+        rm release_notes.md
 
     - name: Update major version tag
       if: inputs.update-major-tag == 'true'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         MAJOR: ${{ steps.version.outputs.major }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         git tag -f "$MAJOR"
-        git push origin "$MAJOR" --force
+        if ! PUSH_OUT=$(git push origin "$MAJOR" --force 2>&1); then
+          fail "メジャーバージョンタグ ${MAJOR} を更新できませんでした" \
+            "git の出力: $(echo "$PUSH_OUT" | grep -v '^remote: *$' | tail -3 | tr '\n' ' ')" \
+            "タグの強制更新が保護ルールで禁止されている可能性があります" \
+            "対処: Settings → Rules のタグ保護設定を確認するか、update-major-tag を false にしてください"
+        fi
 
     - name: Delete release branch
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         BRANCH: ${{ inputs.branch }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         if ! ERROR=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BRANCH}" 2>&1); then
           if echo "$ERROR" | grep -q "Not Found\|Reference does not exist"; then
-            echo "Branch already deleted, skipping."
+            echo "::notice::ブランチ ${BRANCH} は既に削除されているためスキップします"
           else
-            echo "::error::Failed to delete release branch: $ERROR"
-            exit 1
+            fail "リリースブランチ ${BRANCH} を削除できませんでした" \
+              "API の応答: $(echo "$ERROR" | head -3 | tr '\n' ' ')" \
+              "タグと GitHub Release の作成は完了しているため、リリース自体は成立しています" \
+              "対処: ブランチ保護設定を確認し、${BRANCH} を手動で削除してください"
           fi
         fi

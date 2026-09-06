@@ -47,33 +47,79 @@ runs:
     - name: Validate inputs
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ inputs.version }}
         BUMP: ${{ inputs.bump }}
         BUMP_TYPE: ${{ inputs.version-bump-type }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        require_token "$GITHUB_TOKEN_INPUT" "github-token" "contents:write と pull-requests:write"
+
         case "$BUMP" in
           none|auto|major|minor|patch) ;;
-          *) echo "::error::bump must be none, auto, major, minor, or patch (got: ${BUMP})"; exit 1 ;;
+          *) fail "bump の値 '${BUMP}' は指定できません" \
+               "指定できるのは none / auto / major / minor / patch のいずれかです" \
+               "対処: 呼び出し側ワークフローの bump 入力を見直してください" ;;
         esac
 
         case "$BUMP_TYPE" in
           npm|python|pyproject|xcodegen|none) ;;
-          *) echo "::error::version-bump-type must be npm, python, pyproject, xcodegen, or none (got: ${BUMP_TYPE})"; exit 1 ;;
+          *) fail "version-bump-type の値 '${BUMP_TYPE}' は指定できません" \
+               "指定できるのは npm / python / pyproject / xcodegen / none のいずれかです" \
+               "対処: 呼び出し側ワークフローの version-bump-type 入力を見直してください" ;;
         esac
 
         if [ -n "$VERSION" ] && [ "$BUMP" != "none" ]; then
-          echo "::error::version と bump は同時に指定できません (version=${VERSION}, bump=${BUMP})"
-          exit 1
+          fail "version と bump は同時に指定できません (version=${VERSION}, bump=${BUMP})" \
+            "バージョンの決め方が 2 通り指示されているため、どちらを使うか決められません" \
+            "対処: バージョンを直接決めるなら bump を none にし、算出させるなら version を空にしてください"
         fi
 
         if [ -z "$VERSION" ] && [ "$BUMP" = "none" ]; then
-          echo "::error::version と bump のいずれかを指定してください"
-          exit 1
+          fail "version と bump のどちらも指定されていません" \
+            "リリースするバージョンを決められません" \
+            "対処: version に semver (例 1.3.0) を入れるか、bump に auto / major / minor / patch を指定してください"
         fi
 
-        if [ -n "$VERSION" ] && ! echo "$VERSION" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-          echo "::error::Version must be in semver format (e.g. 1.3.0)"
-          exit 1
+        if [ -n "$VERSION" ] && ! is_semver "$VERSION"; then
+          fail "version '${VERSION}' は semver として解釈できません" \
+            "受け付けるのは X.Y.Z 形式の 3 桁の数字のみです (先頭の v やプレリリース識別子は不可)" \
+            "対処: 1.3.0 のような形式で指定してください"
+        fi
+
+        require_commands git jq gh
+        if [ "$BUMP_TYPE" = "npm" ]; then
+          require_commands npm
+        fi
+
+    - name: Verify token
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        # トークンが無効・期限切れでも checkout や gh は文脈の分からないエラーを出すため、
+        # 実際に API を 1 回叩いて先に切り分ける。
+        if ! REPO_JSON=$(gh api "repos/${GITHUB_REPOSITORY}" 2>&1); then
+          fail "github-token でリポジトリ ${GITHUB_REPOSITORY} にアクセスできません" \
+            "API の応答: $(echo "$REPO_JSON" | head -3 | tr '\n' ' ')" \
+            "トークンの期限切れ・失効、またはこのリポジトリがトークンのスコープ外である可能性があります" \
+            "対処: contents:write と pull-requests:write を持つ有効な PAT を再登録してください"
+        fi
+
+        # fine-grained PAT や GITHUB_TOKEN では permissions が返らないことがあるため、
+        # 明示的に push=false と分かったときだけ落とす。
+        CAN_PUSH=$(echo "$REPO_JSON" | jq -r '.permissions.push // "unknown"')
+        if [ "$CAN_PUSH" = "false" ]; then
+          fail "github-token に ${GITHUB_REPOSITORY} への書き込み権限がありません" \
+            "この Action はリリースブランチの push と PR 作成を行うため、読み取り専用のトークンでは動作しません" \
+            "対処: contents:write と pull-requests:write を持つトークンに差し替えてください"
         fi
 
     - uses: actions/checkout@v4
@@ -86,6 +132,7 @@ runs:
       id: resolve
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ inputs.version }}
         BUMP: ${{ inputs.bump }}
         BUMP_TYPE: ${{ inputs.version-bump-type }}
@@ -95,6 +142,15 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        # 現在のバージョンは version 明示指定でも後段の重複チェックに使うため常に読む。
+        # bump-type が none のリポジトリはバージョンを持つファイルが無いため最新タグを使う。
+        SOURCE=$(version_source_path "$BUMP_TYPE" "$PYTHON_VERSION_FILE" "$PYPROJECT_PATH" "$XCODEGEN_VERSION_FILE")
+        CURRENT=$(read_current_version "$BUMP_TYPE" "$PYTHON_VERSION_FILE" "$PYPROJECT_PATH" "$XCODEGEN_VERSION_FILE")
+
+        echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+        echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
 
         if [ -n "$VERSION" ]; then
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -102,35 +158,16 @@ runs:
           exit 0
         fi
 
-        # 現在のバージョンを version-bump-type ごとの真実源から取得する。
-        # bump-type が none のリポジトリはバージョンを持つファイルが無いため最新タグを使う。
-        case "$BUMP_TYPE" in
-          npm)
-            CURRENT=$([ -f package.json ] && jq -r '.version // ""' package.json || echo "")
-            SOURCE="package.json"
-            ;;
-          python)
-            CURRENT=$([ -f "$PYTHON_VERSION_FILE" ] && sed -n 's/^__version__ = "\(.*\)"/\1/p' "$PYTHON_VERSION_FILE" | head -1 || echo "")
-            SOURCE="$PYTHON_VERSION_FILE"
-            ;;
-          pyproject)
-            CURRENT=$([ -f "$PYPROJECT_PATH" ] && sed -n 's/^version = "\(.*\)"/\1/p' "$PYPROJECT_PATH" | head -1 || echo "")
-            SOURCE="$PYPROJECT_PATH"
-            ;;
-          xcodegen)
-            CURRENT=$([ -f "$XCODEGEN_VERSION_FILE" ] && sed -n 's/.*MARKETING_VERSION: "\(.*\)"/\1/p' "$XCODEGEN_VERSION_FILE" | head -1 || echo "")
-            SOURCE="$XCODEGEN_VERSION_FILE"
-            ;;
-          none)
-            CURRENT=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-            CURRENT="${CURRENT#v}"
-            SOURCE="最新タグ"
-            ;;
-        esac
-
-        if ! echo "$CURRENT" | grep -qE '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
-          echo "::error::現在のバージョンを semver として取得できませんでした (source=${SOURCE}, 取得値='${CURRENT}')。version を明示指定してください"
-          exit 1
+        if ! is_semver "$CURRENT"; then
+          if [ "$BUMP_TYPE" = "none" ]; then
+            fail "bump の起点になる既存タグが見つからないため、バージョンを算出できません" \
+              "version-bump-type=none では最新の \`vX.Y.Z\` タグを起点にしますが、取得値は '${CURRENT}' でした" \
+              "対処: 初回リリースなら version に semver を明示指定してください"
+          fi
+          fail "現在のバージョンを ${SOURCE} から読み取れないため、bump できません" \
+            "取得値: '${CURRENT}' (semver として解釈できません)" \
+            "${SOURCE} が存在しないか、バージョンの書式が想定と違う可能性があります" \
+            "対処: ${SOURCE} のバージョン表記を X.Y.Z に直すか、version を明示指定してください"
         fi
 
         BUMP_KIND="$BUMP"
@@ -139,8 +176,9 @@ runs:
         if [ "$BUMP_KIND" = "auto" ]; then
           LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
           if [ -z "$LAST_TAG" ]; then
-            echo "::error::GitHub Release が存在しないため auto 判定できません。version または bump を明示指定してください"
-            exit 1
+            fail "GitHub Release が存在しないため auto 判定できません" \
+              "auto は前回リリース以降にマージされた PR のタイトルから種別を決めるため、起点になるリリースが要ります" \
+              "対処: 初回リリースでは version または bump (major / minor / patch) を明示指定してください"
           fi
           LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
 
@@ -152,23 +190,25 @@ runs:
             | jq '[.[] | select(.title | test("^release(\\(.+\\))?!?:") | not)]')
 
           if [ "$(echo "$PR_JSON" | jq 'length')" -eq 0 ]; then
-            echo "::error::前回リリース ${LAST_TAG} 以降にマージされた PR が無いため auto 判定できません"
-            exit 1
+            fail "前回リリース ${LAST_TAG} 以降にマージされた PR が無いため auto 判定できません" \
+              "リリースする変更がまだ入っていない可能性があります" \
+              "対処: 変更をマージしてから再実行するか、version または bump を明示指定してください"
           fi
 
           BREAKING=$(echo "$PR_JSON" | jq -r '
             .[] | select((.title | test("^[a-z]+(\\(.+\\))?!:")) or ((.body // "") | test("(^|\n)BREAKING CHANGE:")))
             | "- #\(.number) \(.title)"')
           if [ -n "$BREAKING" ]; then
-            echo "::error::breaking change を含む PR を検出しました。major は自動判定しません。bump=major または version を明示指定してください"
             {
-              echo "### auto 判定に失敗しました"
-              echo ""
-              echo "breaking change を含む PR を検出しました。major は自動では上げません。"
+              echo "<details><summary>breaking change を含む PR</summary>"
               echo ""
               echo "$BREAKING"
+              echo ""
+              echo "</details>"
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            fail "breaking change を含む PR があるため auto 判定を中止しました" \
+              "major は事故防止のため自動では上げません" \
+              "対処: bump=major を明示指定するか、version を直接指定してください (対象 PR はこの下に出力しています)"
           fi
 
           FEATS=$(echo "$PR_JSON" | jq -r '.[] | select(.title | test("^feat(\\(.+\\))?:")) | "- #\(.number) \(.title)"')
@@ -183,8 +223,10 @@ runs:
             REASON="fix / chore などの PR のみ"
             MATCHED="$PATCHES"
           else
-            echo "::error::前回リリース ${LAST_TAG} 以降の PR タイトルから種別を判定できませんでした。version または bump を明示指定してください"
-            exit 1
+            fail "前回リリース ${LAST_TAG} 以降の PR タイトルから bump 種別を判定できませんでした" \
+              "feat / fix / perf / refactor / chore / ci / docs / build / style / test のいずれの prefix も付いていません" \
+              "暗黙の patch にはしません" \
+              "対処: version または bump を明示指定してください"
           fi
         fi
 
@@ -212,14 +254,51 @@ runs:
           fi
         } >> "$GITHUB_STEP_SUMMARY"
 
-    - name: Check tag does not already exist
+    - name: Check release version is available
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ inputs.github-token }}
         VERSION: ${{ steps.resolve.outputs.version }}
+        CURRENT: ${{ steps.resolve.outputs.current }}
+        SOURCE: ${{ steps.resolve.outputs.source }}
+        BUMP_TYPE: ${{ inputs.version-bump-type }}
       run: |
-        if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1; then
-          echo "::error::Tag v${VERSION} already exists"
-          exit 1
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null 2>&1 \
+          || git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+          fail "タグ v${VERSION} は既に存在します" \
+            "同じバージョンを 2 度リリースすることはできません" \
+            "対処: 次のバージョンを指定するか、bump を使って採番してください"
+        fi
+
+        if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          fail "GitHub Release v${VERSION} は既に存在します" \
+            "タグは無いのに Release だけが残っている状態です (下書きリリースなど)" \
+            "対処: 既存の Release を削除するか、別のバージョンを指定してください"
+        fi
+
+        # ファイル上のバージョンと同じ値を指定すると、bump ステップが
+        # 「Version not changed」のような文脈の分からないエラーで落ちるため手前で弾く。
+        if [ "$BUMP_TYPE" != "none" ] && is_semver "$CURRENT"; then
+          if [ "$VERSION" = "$CURRENT" ]; then
+            fail "リリースバージョン ${VERSION} は ${SOURCE} の現在のバージョンと同じです" \
+              "${SOURCE} は既に ${CURRENT} になっているため、バージョンを上げられません" \
+              "対処: ${CURRENT} より大きいバージョンを指定するか、bump (auto / major / minor / patch) を使ってください" \
+              "現在のバージョンをそのまま初回リリースにしたい場合は、${SOURCE} のバージョンを下げてから再実行してください"
+          fi
+
+          if ! version_gt "$VERSION" "$CURRENT"; then
+            fail "リリースバージョン ${VERSION} は ${SOURCE} の現在のバージョン ${CURRENT} より小さい値です" \
+              "この Action は main からリリースブランチを切るため、バージョンを戻すことは想定していません" \
+              "対処: ${CURRENT} より大きいバージョンを指定してください"
+          fi
+        fi
+
+        if git ls-remote --exit-code --heads origin "release/v${VERSION}" >/dev/null 2>&1; then
+          echo "::notice::ブランチ release/v${VERSION} は既に存在します。main の内容で上書きし、既存の PR があれば更新します"
         fi
 
     - name: Create release branch
@@ -227,7 +306,8 @@ runs:
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
       run: |
-        git checkout -b "release/v${VERSION}"
+        set -euo pipefail
+        git checkout -B "release/v${VERSION}"
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -235,73 +315,146 @@ runs:
       if: inputs.version-bump-type == 'npm'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
       run: |
-        npm version "$VERSION" --no-git-tag-version
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if [ ! -f package.json ]; then
+          fail "package.json が見つかりません" \
+            "version-bump-type=npm はリポジトリ直下の package.json を書き換えます" \
+            "対処: package.json を置くか、version-bump-type を実際のバージョン管理方法に合わせてください"
+        fi
+
+        if ! NPM_OUT=$(npm version "$VERSION" --no-git-tag-version 2>&1); then
+          fail "package.json のバージョン更新に失敗しました (npm version ${VERSION})" \
+            "npm の出力: $(echo "$NPM_OUT" | head -3 | tr '\n' ' ')" \
+            "対処: package.json の version フィールドが正しい semver になっているか確認してください"
+        fi
+
         git add package.json
         if [ -f package-lock.json ]; then git add package-lock.json; fi
+
+        if git diff --cached --quiet; then
+          fail "バージョン更新による差分がありません" \
+            "package.json は既に ${VERSION} だった可能性があります" \
+            "対処: 未リリースの新しいバージョンを指定してください"
+        fi
+
         git commit -m "release: v${VERSION}"
 
     - name: Version bump (python)
       if: inputs.version-bump-type == 'python'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
         VERSION_FILE: ${{ inputs.python-version-file }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         if [ ! -f "$VERSION_FILE" ]; then
-          echo "::error::${VERSION_FILE} not found"
-          exit 1
+          fail "バージョンファイル ${VERSION_FILE} が見つかりません" \
+            "version-bump-type=python はこのファイルの __version__ を書き換えます" \
+            "対処: python-version-file に実際のパスを指定してください"
         fi
+
+        if ! grep -q '^__version__ = ".*"' "$VERSION_FILE"; then
+          fail "${VERSION_FILE} に \`__version__ = \"...\"\` の行がありません" \
+            "行頭から始まる __version__ の代入だけを書き換え対象にしています" \
+            "対処: ${VERSION_FILE} の記述を \`__version__ = \"1.2.3\"\` の形式に揃えてください"
+        fi
+
         sed -i "s/__version__ = \".*\"/__version__ = \"${VERSION}\"/" "$VERSION_FILE"
         if ! grep -q "__version__ = \"${VERSION}\"" "$VERSION_FILE"; then
-          echo "::error::Failed to update version in ${VERSION_FILE}"
-          exit 1
+          fail "${VERSION_FILE} のバージョン更新に失敗しました" \
+            "置換後も __version__ が ${VERSION} になっていません" \
+            "対処: ${VERSION_FILE} の記述を \`__version__ = \"1.2.3\"\` の形式に揃えてください"
         fi
+
         git add "$VERSION_FILE"
+        if git diff --cached --quiet; then
+          fail "バージョン更新による差分がありません" \
+            "${VERSION_FILE} は既に ${VERSION} だった可能性があります" \
+            "対処: 未リリースの新しいバージョンを指定してください"
+        fi
+
         git commit -m "release: v${VERSION}"
 
     - name: Version bump (pyproject)
       if: inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
         PYPROJECT_PATH: ${{ inputs.pyproject-path }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         if [ ! -f "$PYPROJECT_PATH" ]; then
-          echo "::error::${PYPROJECT_PATH} not found"
-          exit 1
+          fail "${PYPROJECT_PATH} が見つかりません" \
+            "version-bump-type=pyproject はこのファイルのトップレベル version を書き換えます" \
+            "対処: pyproject-path に実際のパスを指定してください"
         fi
+
         # Replace only top-level `version = "..."` lines (^version = ) to avoid
         # touching dependency version specifiers inside the file.
-        if [ "$(grep -cE '^version = "[^"]+"' "$PYPROJECT_PATH")" -ne 1 ]; then
-          echo "::error::Expected exactly one version field in ${PYPROJECT_PATH}"
-          exit 1
+        FIELD_COUNT=$(grep -cE '^version = "[^"]+"' "$PYPROJECT_PATH" || true)
+        if [ "$FIELD_COUNT" -ne 1 ]; then
+          fail "${PYPROJECT_PATH} のトップレベル version 行が 1 個ではありません (検出数: ${FIELD_COUNT})" \
+            "依存関係のバージョン指定を巻き込まないよう、行頭の \`version = \"...\"\` だけを書き換えます" \
+            "対処: ${PYPROJECT_PATH} に行頭から始まる version 行がちょうど 1 行あるようにしてください"
         fi
+
         sed -i -E 's/^version = "[^"]+"/version = "'"${VERSION}"'"/' "$PYPROJECT_PATH"
         if ! grep -q "^version = \"${VERSION}\"" "$PYPROJECT_PATH"; then
-          echo "::error::Failed to update version in ${PYPROJECT_PATH}"
-          exit 1
+          fail "${PYPROJECT_PATH} のバージョン更新に失敗しました" \
+            "置換後も version が ${VERSION} になっていません" \
+            "対処: ${PYPROJECT_PATH} の version 行の記述を確認してください"
         fi
+
         git add "$PYPROJECT_PATH"
 
     - name: Version bump (xcodegen)
       if: inputs.version-bump-type == 'xcodegen'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
         VERSION_FILE: ${{ inputs.xcodegen-version-file }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         if [ ! -f "$VERSION_FILE" ]; then
-          echo "::error::${VERSION_FILE} not found"
-          exit 1
+          fail "${VERSION_FILE} が見つかりません" \
+            "version-bump-type=xcodegen はこのファイルの MARKETING_VERSION を書き換えます" \
+            "対処: xcodegen-version-file に実際のパスを指定してください"
         fi
+
+        if ! grep -q 'MARKETING_VERSION: ".*"' "$VERSION_FILE"; then
+          fail "${VERSION_FILE} に \`MARKETING_VERSION: \"...\"\` の記述がありません" \
+            "この記述を書き換え対象にしています" \
+            "対処: ${VERSION_FILE} に MARKETING_VERSION を追加してください"
+        fi
+
         sed -i "s/MARKETING_VERSION: \".*\"/MARKETING_VERSION: \"${VERSION}\"/" "$VERSION_FILE"
         if ! grep -q "MARKETING_VERSION: \"${VERSION}\"" "$VERSION_FILE"; then
-          echo "::error::Failed to update MARKETING_VERSION in ${VERSION_FILE}"
-          exit 1
+          fail "${VERSION_FILE} の MARKETING_VERSION 更新に失敗しました" \
+            "置換後も MARKETING_VERSION が ${VERSION} になっていません" \
+            "対処: ${VERSION_FILE} の記述を確認してください"
         fi
+
         git add "$VERSION_FILE"
+        if git diff --cached --quiet; then
+          fail "バージョン更新による差分がありません" \
+            "${VERSION_FILE} は既に ${VERSION} だった可能性があります" \
+            "対処: 未リリースの新しいバージョンを指定してください"
+        fi
+
         git commit -m "release: v${VERSION}"
 
     - name: Post-bump command
@@ -312,8 +465,17 @@ runs:
       if: inputs.version-bump-type == 'pyproject' && inputs.post-bump-command != ''
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         POST_BUMP_COMMAND: ${{ inputs.post-bump-command }}
-      run: bash -c "$POST_BUMP_COMMAND"
+      run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if ! bash -c "$POST_BUMP_COMMAND"; then
+          fail "post-bump-command が失敗しました: ${POST_BUMP_COMMAND}" \
+            "バージョン更新後・コミット前に実行するコマンドが非ゼロで終了したため、リリースを中止しました" \
+            "対処: 上のログでコマンドの出力を確認してください"
+        fi
 
     - name: Stage extra paths
       # Designed for pyproject type: stages artifact files generated by post-bump-command
@@ -322,18 +484,38 @@ runs:
       if: inputs.version-bump-type == 'pyproject' && inputs.extra-paths-to-commit != ''
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         EXTRA_PATHS: ${{ inputs.extra-paths-to-commit }}
       run: |
-        echo "$EXTRA_PATHS" | tr ' \t\n' '\n' | grep -v '^$' | while IFS= read -r path; do
-          git add -- "$path"
-        done
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        while IFS= read -r path; do
+          [ -z "$path" ] && continue
+          if ! ADD_OUT=$(git add -- "$path" 2>&1); then
+            fail "extra-paths-to-commit のパス '${path}' を追加できませんでした" \
+              "git の出力: $(echo "$ADD_OUT" | head -3 | tr '\n' ' ')" \
+              "そのパスが存在しないか、.gitignore で除外されている可能性があります" \
+              "対処: パスの綴りを確認するか、post-bump-command がそのファイルを生成しているか確認してください"
+          fi
+        done < <(echo "$EXTRA_PATHS" | tr ' \t' '\n')
 
     - name: Commit (pyproject)
       if: inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if git diff --cached --quiet; then
+          fail "コミットする差分がありません" \
+            "pyproject.toml が既に ${VERSION} だったか、想定した書き換えが行われていません" \
+            "対処: 未リリースの新しいバージョンを指定してください"
+        fi
+
         git commit -m "release: v${VERSION}"
 
     - name: Empty commit fallback (no bump)
@@ -342,14 +524,24 @@ runs:
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
       run: |
+        set -euo pipefail
         git commit --allow-empty -m "release: v${VERSION}"
 
     - name: Push release branch
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
       run: |
-        git push --force-with-lease origin "release/v${VERSION}"
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if ! PUSH_OUT=$(git push --force-with-lease origin "release/v${VERSION}" 2>&1); then
+          fail "リリースブランチ release/v${VERSION} を push できませんでした" \
+            "git の出力: $(echo "$PUSH_OUT" | grep -v '^remote: *$' | tail -3 | tr '\n' ' ')" \
+            "トークンの書き込み権限不足、ブランチ保護ルール、または実行中に同名ブランチが更新された可能性があります" \
+            "対処: github-token の権限と release/* に対するブランチ保護設定を確認してください"
+        fi
 
     - name: Get previous tag
       id: prev_tag
@@ -393,30 +585,56 @@ runs:
     - name: Ensure release label exists
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
-        gh label create release --color "0075ca" --force
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        if ! LABEL_OUT=$(gh label create release --color "0075ca" --force 2>&1); then
+          fail "release ラベルを作成できませんでした" \
+            "gh の出力: $(echo "$LABEL_OUT" | head -3 | tr '\n' ' ')" \
+            "github-token に issues:write / pull-requests:write が無い可能性があります" \
+            "対処: トークンの権限を確認してください"
+        fi
 
     - name: Create or update release PR
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         VERSION: ${{ steps.resolve.outputs.version }}
         CHANGELOG: ${{ steps.changelog.outputs.changelog }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         printf '%s' "${CHANGELOG}" > changelog_body.txt
         PR_STATE=$(gh pr view "release/v${VERSION}" --json state --jq '.state' 2>/dev/null || echo "NONE")
         if [ "$PR_STATE" = "OPEN" ]; then
-          gh pr edit "release/v${VERSION}" \
+          if ! PR_OUT=$(gh pr edit "release/v${VERSION}" \
             --title "release: v${VERSION}" \
             --body-file changelog_body.txt \
-            --add-label "release"
+            --add-label "release" 2>&1); then
+            fail "既存のリリース PR を更新できませんでした" \
+              "gh の出力: $(echo "$PR_OUT" | head -3 | tr '\n' ' ')" \
+              "対処: github-token の pull-requests:write 権限を確認してください"
+          fi
+        elif [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; then
+          fail "ブランチ release/v${VERSION} の PR は既に ${PR_STATE} です" \
+            "同じバージョンのリリース PR が過去に処理されているため、新しい PR を作成できません" \
+            "対処: 次のバージョンを指定してください"
         else
-          gh pr create \
+          if ! PR_OUT=$(gh pr create \
             --base main \
             --head "release/v${VERSION}" \
             --title "release: v${VERSION}" \
             --body-file changelog_body.txt \
-            --label "release"
+            --label "release" 2>&1); then
+            fail "リリース PR を作成できませんでした" \
+              "gh の出力: $(echo "$PR_OUT" | head -3 | tr '\n' ' ')" \
+              "github-token の権限不足、または main と差分が無い可能性があります" \
+              "対処: 上の出力を確認してください"
+          fi
         fi
         rm changelog_body.txt
