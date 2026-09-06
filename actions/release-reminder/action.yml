@@ -13,15 +13,45 @@ inputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        THRESHOLD: ${{ inputs.threshold }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
+        require_token "$GITHUB_TOKEN_INPUT" "github-token" "pull-requests:write"
+        require_commands jq gh
+
+        if [ -z "$PR_NUMBER" ]; then
+          fail "PR 番号を取得できません" \
+            "この Action は github.event.pull_request.number を使うため、pull_request イベントでのみ動作します" \
+            "対処: ワークフローのトリガーを \`on: pull_request\` にしてください"
+        fi
+
+        if ! echo "$THRESHOLD" | grep -qE '^[0-9]+$'; then
+          fail "threshold の値 '${THRESHOLD}' は数値ではありません" \
+            "マージ済み PR 件数と比較するため、0 以上の整数が必要です" \
+            "対処: 呼び出し側ワークフローの threshold 入力を見直してください"
+        fi
+
     - name: Check and comment
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         GH_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         HEAD_REF: ${{ github.event.pull_request.head.ref }}
         EVENT_ACTION: ${{ github.event.action }}
         THRESHOLD: ${{ inputs.threshold }}
       run: |
+        set -euo pipefail
+        source "${ACTION_PATH}/../_lib/common.sh"
+
         MARKER="<!-- release-reminder-bot -->"
 
         # リリース PR 自身にはコメントしない
@@ -39,8 +69,12 @@ runs:
         fi
 
         LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
-        PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
-          --search "merged:>=${LAST_DATE}" --json number,title)
+        if ! PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
+          --search "merged:>=${LAST_DATE}" --json number,title 2>&1); then
+          fail "マージ済み PR の一覧を取得できませんでした" \
+            "gh の出力: $(echo "$PR_JSON" | head -3 | tr '\n' ' ')" \
+            "対処: github-token に pull-requests:read 以上の権限があるか確認してください"
+        fi
         COUNT=$(echo "$PR_JSON" | jq 'length')
         PR_LIST=$(echo "$PR_JSON" | jq -r \
           --arg repo "$GITHUB_REPOSITORY" \
@@ -76,4 +110,8 @@ runs:
           echo "No existing comment found, creating new one"
         fi
 
-        gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+        if ! COMMENT_OUT=$(gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>&1); then
+          fail "PR #${PR_NUMBER} にコメントできませんでした" \
+            "gh の出力: $(echo "$COMMENT_OUT" | head -3 | tr '\n' ' ')" \
+            "対処: ワークフローの permissions に pull-requests: write があるか確認してください"
+        fi
