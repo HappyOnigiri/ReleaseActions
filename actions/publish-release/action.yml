@@ -11,6 +11,12 @@ inputs:
   update-major-tag:
     description: "メジャーバージョンタグを更新するか (true/false)"
     default: "false"
+  assets:
+    description: "添付するファイルのパスを改行区切りで指定（glob 不可）。空なら従来どおり即公開"
+    default: ""
+  target-commit:
+    description: "リリース対象の完全なコミット SHA。空なら github.sha"
+    default: ""
   github-token:
     description: "contents:write 権限の PAT"
     required: true
@@ -26,6 +32,7 @@ runs:
         PR_BODY: ${{ inputs.pr-body }}
         UPDATE_MAJOR_TAG: ${{ inputs.update-major-tag }}
         GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        TARGET_COMMIT: ${{ inputs.target-commit || github.sha }}
       run: |
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
@@ -52,6 +59,12 @@ runs:
                "対処: 呼び出し側ワークフローの update-major-tag 入力を見直してください" ;;
         esac
 
+        if ! [[ "$TARGET_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          fail "target-commit は完全なコミット SHA で指定してください" \
+            "取得値: ${TARGET_COMMIT}" \
+            "対処: 成果物のビルドに使ったコミット SHA を渡してください"
+        fi
+
         if [ -z "$PR_BODY" ]; then
           echo "::notice::pr-body が空のため、リリースノートが空の GitHub Release を作成します"
         fi
@@ -72,10 +85,20 @@ runs:
             "対処: contents:write を持つ有効な PAT を再登録してください"
         fi
 
+    - name: Stage release assets before checkout
+      id: assets
+      if: inputs.assets != ''
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        RELEASE_ASSETS: ${{ inputs.assets }}
+      run: bash "${ACTION_PATH}/stage-assets.sh"
+
     - uses: actions/checkout@v4
       with:
         token: ${{ inputs.github-token }}
-        fetch-tags: true
+        ref: ${{ inputs.target-commit || github.sha }}
+        fetch-depth: 0
 
     - name: Extract version from branch name
       id: version
@@ -93,26 +116,8 @@ runs:
       env:
         ACTION_PATH: ${{ github.action_path }}
         TAG: ${{ steps.version.outputs.tag }}
-      run: |
-        set -euo pipefail
-        source "${ACTION_PATH}/../_lib/common.sh"
-
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-        # 再実行に備えて、既にタグがある場合は成功として扱う。
-        if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-          echo "::notice::タグ ${TAG} は既に存在するため作成をスキップします"
-          exit 0
-        fi
-
-        git tag "$TAG"
-        if ! PUSH_OUT=$(git push origin "$TAG" 2>&1); then
-          fail "タグ ${TAG} を push できませんでした" \
-            "git の出力: $(echo "$PUSH_OUT" | grep -v '^remote: *$' | tail -3 | tr '\n' ' ')" \
-            "github-token の contents:write 権限不足、またはタグ保護ルールに掛かっている可能性があります" \
-            "対処: トークンの権限と Settings → Rules のタグ保護設定を確認してください"
-        fi
+        ASSET_DIR: ${{ steps.assets.outputs.directory }}
+      run: bash "${ACTION_PATH}/create-tag.sh"
 
     - name: Create GitHub Release
       shell: bash
@@ -121,25 +126,8 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         TAG: ${{ steps.version.outputs.tag }}
         BODY: ${{ inputs.pr-body }}
-      run: |
-        set -euo pipefail
-        source "${ACTION_PATH}/../_lib/common.sh"
-
-        printf '%s\n' "$BODY" > release_notes.md
-        if gh release view "$TAG" >/dev/null 2>&1; then
-          if ! RELEASE_OUT=$(gh release edit "$TAG" --notes-file release_notes.md 2>&1); then
-            fail "既存の GitHub Release ${TAG} を更新できませんでした" \
-              "gh の出力: $(echo "$RELEASE_OUT" | head -3 | tr '\n' ' ')" \
-              "対処: github-token の contents:write 権限を確認してください"
-          fi
-        else
-          if ! RELEASE_OUT=$(gh release create "$TAG" --title "$TAG" --notes-file release_notes.md 2>&1); then
-            fail "GitHub Release ${TAG} を作成できませんでした" \
-              "gh の出力: $(echo "$RELEASE_OUT" | head -3 | tr '\n' ' ')" \
-              "対処: github-token の contents:write 権限と、タグ ${TAG} が push されているかを確認してください"
-          fi
-        fi
-        rm release_notes.md
+        ASSET_DIR: ${{ steps.assets.outputs.directory }}
+      run: bash "${ACTION_PATH}/publish.sh"
 
     - name: Update major version tag
       if: inputs.update-major-tag == 'true'

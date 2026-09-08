@@ -146,9 +146,69 @@ jobs:
 | `branch` | ✓ | - | マージされたリリースブランチ名（例 `release/v1.3.0`） |
 | `pr-body` | ✓ | - | PR 本文（リリースノートとして使う） |
 | `update-major-tag` | - | `false` | `v1` のようなメジャータグを更新するか |
+| `assets` | - | `""` | 添付するファイルのパスを改行区切りで指定（glob 不可） |
+| `target-commit` | - | `github.sha` | リリース対象の完全なコミット SHA |
 | `github-token` | ✓ | - | `contents:write` 権限の PAT |
 
 トークン未設定・無効、`branch` が `release/vX.Y.Z` 形式でない、`update-major-tag` が `true` / `false` 以外、タグ push・Release 作成・ブランチ削除の失敗を、それぞれ対処つきで報告する。タグや Release が既にある場合は再実行とみなして続行する。ブランチ削除だけが失敗した場合は、タグと Release の作成が完了していることをメッセージに含める。
+
+### 成果物を添付して公開する
+
+`assets` を指定すると、draft Release を作成し、全ファイルのアップロード成功後に公開する。
+添付・公開に失敗した場合はリリースブランチを残し、同じワークフローを再実行できる。
+添付が完了するまで `releases/latest/download/<ファイル名>` の取得先は切り替わらない。
+`assets` を省略した場合は従来どおり即公開し、既存 Release の本文も更新する。
+
+- ファイルは Action を呼ぶ前にビルドし、`target-commit` と同じコミットの成果物を渡す。
+- パスは呼び出し時の作業ディレクトリからの相対パス、または絶対パスを使う。
+- ファイル名は英数字で始め、英数字・`.`・`-`・`_` を使用し、添付一覧の中で一意にする。
+- Action 内の checkout が成果物を消さないよう、先に `runner.temp` へコピーする。
+- 既存タグが対象コミットと異なる場合は、Release を変更せず停止する。
+- draft の再実行では同名ファイルを再アップロードするため、呼び出し側は毎回すべての成果物を渡す。
+- 公開済みの場合は本文・添付ファイル・latest を変更せず、後続のメジャータグ更新とリリースブランチ削除へ進む。
+- 同時実行による添付・公開の競合を防ぐため、呼び出し側で publish ジョブを直列化する。
+
+```yaml
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'release/v')
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: publish-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+      # 言語のセットアップと成果物のビルドは、このステップより前に実行する。
+      - uses: HappyOnigiri/ReleaseActions/actions/publish-release@main
+        with:
+          branch: ${{ github.event.pull_request.head.ref }}
+          pr-body: ${{ github.event.pull_request.body }}
+          target-commit: ${{ github.event.pull_request.merge_commit_sha }}
+          assets: |
+            dist/install.sh
+            dist/app.tar.gz
+            dist/checksums.txt
+          github-token: ${{ secrets.GH_TOKEN }}
+```
+
+呼び出し元は `pull_request` の `closed` イベントを購読し、`contents: write` 権限を設定する。
+インストーラーを配る場合、呼び出し側のビルドでタグを埋め込み、同じタグのバイナリを取得させる。
+README は `releases/latest/download/install.sh` を固定で案内でき、バージョン更新のためのコミットは不要になる。
+
+### テスト
+
+```sh
+python3 -m pip install -r tests/requirements.txt
+make test
+```
+
+Python 3.10 以降と ShellCheck が必要。
+テストは一時 Git リポジトリと偽の `gh` を使い、実際のタグや GitHub Release を変更しない。
+Action のステップを読み込み、checkout による成果物の削除、部分アップロードからの再実行、公開済み成果物の保持を検証する。
 
 ## actions/release-reminder
 
