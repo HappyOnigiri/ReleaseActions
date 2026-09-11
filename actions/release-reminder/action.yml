@@ -68,14 +68,22 @@ runs:
           exit 0
         fi
 
+        # 検査する PR 件数の上限。ここに達したら実数は数えず「N 件以上」と表示する
+        MAX_PRS=100
+
         LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
         if ! PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
-          --search "merged:>=${LAST_DATE}" --json number,title 2>&1); then
+          --search "merged:>=${LAST_DATE}" --limit "$MAX_PRS" --json number,title 2>&1); then
           fail "マージ済み PR の一覧を取得できませんでした" \
             "gh の出力: $(echo "$PR_JSON" | head -3 | tr '\n' ' ')" \
             "対処: github-token に pull-requests:read 以上の権限があるか確認してください"
         fi
         COUNT=$(echo "$PR_JSON" | jq 'length')
+        if [ "$COUNT" -ge "$MAX_PRS" ]; then
+          COUNT_TEXT="${MAX_PRS} 件以上"
+        else
+          COUNT_TEXT="${COUNT} 件"
+        fi
         PR_LIST=$(echo "$PR_JSON" | jq -r \
           --arg repo "$GITHUB_REPOSITORY" \
           '.[] | "- [#\(.number)](https://github.com/\($repo)/pull/\(.number)) \(.title)"')
@@ -84,11 +92,15 @@ runs:
         if [ "$COUNT" -eq 0 ]; then
           BODY+=$'\n'"**Release Reminder**: 前回リリース \`${LAST_TAG}\` 以降にマージされた PR はありません。"
         else
-          BODY+=$'\n'"**Release Reminder**: 前回リリース \`${LAST_TAG}\` から **${COUNT} 件**の PR がマージされています。"
+          BODY+=$'\n'"**Release Reminder**: 前回リリース \`${LAST_TAG}\` から **${COUNT_TEXT}**の PR がマージされています。"
           if [ "$COUNT" -ge "$THRESHOLD" ]; then
             BODY+=$'\nリリースを検討してください。'
           fi
-          BODY+=$'\n\n<details><summary>マージ済み PR 一覧</summary>\n\n'
+          if [ "$COUNT" -ge "$MAX_PRS" ]; then
+            BODY+=$'\n\n'"<details><summary>マージ済み PR 一覧（うち ${MAX_PRS} 件）</summary>"$'\n\n'
+          else
+            BODY+=$'\n\n<details><summary>マージ済み PR 一覧</summary>\n\n'
+          fi
           BODY+="$PR_LIST"
           BODY+=$'\n\n</details>'
         fi
