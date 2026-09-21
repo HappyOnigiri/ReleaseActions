@@ -96,7 +96,7 @@ read_current_version() {
       [ -f package.json ] && current=$(jq -r '.version // ""' package.json)
       ;;
     python)
-      [ -f "$py_file" ] && current=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$py_file" | head -1)
+      [ -f "$py_file" ] && current=$(sed -nE 's/^__version__ = "([^"]*)"[[:space:]]*(#.*)?$/\1/p' "$py_file" | head -1)
       ;;
     pyproject)
       [ -f "$pyproject" ] && current=$(sed -n 's/^version = "\(.*\)"/\1/p' "$pyproject" | head -1)
