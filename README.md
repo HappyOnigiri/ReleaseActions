@@ -2,28 +2,29 @@
 
 リリースフロー用の共通 Composite Action 群。`HappyOnigiri/ShareSettings` の `actions/` から移設したもの。
 
-3 つの Action は `release/vX.Y.Z` というブランチ名の規約を共有しているため、同一リポジトリで管理する。
+4 つの Action は `release/vX.Y.Z` というブランチ名の規約を共有しているため、同一リポジトリで管理する。
 
 | Action | 役割 | 呼び出し契機 |
 | --- | --- | --- |
 | `actions/prepare-release` | バージョンを決めてリリースブランチと PR を作成 | `workflow_dispatch`（手動）または `schedule` |
+| `actions/merge-release` | 指定コミットの CI 成功を待ち、通常のマージを実行 | 自動運用のリリース PR 作成後 |
 | `actions/publish-release` | タグと GitHub Release を作成し、リリースブランチを削除 | リリース PR のマージ |
 | `actions/release-reminder` | 前回リリース以降のマージ済み PR 数を PR にコメント | main 宛の PR |
 
-`actions/_lib/common.sh` は Action ではなく、3 つの Action が共有するシェル関数（エラー報告・入力検証・バージョン読み取り）。各ステップから `${{ github.action_path }}/../_lib/common.sh` として読み込む。
+`actions/_lib/common.sh` は Action ではなく、4 つの Action が共有するシェル関数（エラー報告・入力検証・バージョン読み取り）。各ステップから `${{ github.action_path }}/../_lib/common.sh` として読み込む。
 
 > このリポジトリは public である必要がある。ユーザーアカウント配下の private リポジトリの Action は、他リポジトリから `uses:` で参照できないため。
 
 ## リリースの流れ
 
-1. 呼び出し側リポジトリで Release ワークフローを手動実行する（バージョンまたは bump 種別を指定）
+1. 呼び出し側リポジトリで Release ワークフローを手動または定期実行する（バージョンまたは bump 種別を指定）
 2. `prepare-release` が `release/vX.Y.Z` ブランチと、changelog を本文に持つ `release: vX.Y.Z` PR を作成する
-3. PR の CI が通ったらマージする
+3. PR の CI が通ったら人がマージするか、自動運用では `merge-release` で待機・マージする
 4. `publish-release` がタグ `vX.Y.Z` と GitHub Release を作成し、リリースブランチを削除する
 
 ## エラーの扱い
 
-失敗したときに実行ログを追わなくても原因が分かるよう、3 つの Action は共通ヘルパー `actions/_lib/common.sh` の `fail` でエラーを報告する。出力は次の 2 か所。
+失敗したときに実行ログを追わなくても原因が分かるよう、4 つの Action は共通ヘルパー `actions/_lib/common.sh` の `fail` でエラーを報告する。出力は次の 2 か所。
 
 - `::error::` アノテーション: 何が起きたかの要約 1 行（Actions の実行画面の上部に出る）
 - `$GITHUB_STEP_SUMMARY`: 要約に加えて、現在の状態（取得値・パス・API の応答）と対処方法
@@ -61,12 +62,19 @@
 - どの prefix にも当たらない場合は、スキップ設定にかかわらずエラーで停止する（暗黙の patch にはしない）
 - 自身のリリース PR（`release: vX.Y.Z`）は判定対象から除外する
 
+初回も同じ規則で判定する場合は `initial-release: merged-prs` を指定する。
+公開済み Release がなければ main の全マージ済み PR を取得し、通常リリースと同じ分類処理に渡す。
+既定の `initial-release: error` は従来どおり初回の auto をエラーにする。
+
+`skip-if-open-release-pr: "true"` は、main 宛の未マージの `release/vX.Y.Z` PR があれば正常終了する。
+手動作成の PR を自動運用が引き継がないために使い、通常の手動運用では指定しない。
+
 判定結果と対象 PR は `$GITHUB_STEP_SUMMARY` に出力される。
 
 `skip-if-no-changes` は `bump: auto` の対象 PR が 0 件の場合だけ適用する。
 スキップ時はブランチ・コミット・PR・changelog を作成せず、`skipped` に `true` を返し、`version` と PR の出力は空になる。
 コミットの差分ではなく上記の PR 検索結果で判定するため、main への直接 push は対象に含まない。
-初回リリース、breaking change、API エラー、バージョンファイルの不備は正常終了として扱わない。
+初回の auto が無効な場合、breaking change、API エラー、バージョンファイルの不備は正常終了として扱わない。
 `version` または `bump: major / minor / patch` の明示指定では従来どおりリリースを準備する。
 
 ### 実行前に検出する問題
@@ -79,7 +87,7 @@
 | トークン無効・権限不足 | リポジトリの API 取得に失敗、または `permissions.push` が `false` |
 | 入力の矛盾 | `version` と `bump` の同時指定、両方未指定、semver 以外の `version`、未知の `bump` / `version-bump-type` |
 | bump の起点が無い | 真実源のファイルが無い・バージョンが semver でない・`none` で既存タグが無い |
-| auto 判定不能 | GitHub Release が無い、対象 PR が 0 件、prefix が付いていない、breaking change を検出 |
+| auto 判定不能 | 初回の auto が無効、対象 PR が 0 件、prefix が付いていない、breaking change を検出 |
 | バージョン重複 | タグ `vX.Y.Z` が存在、GitHub Release `vX.Y.Z` が存在、真実源の現在バージョンと同値 |
 | バージョン逆行 | 指定バージョンが真実源の現在バージョンより小さい |
 | bump 対象の欠落 | `package.json` / バージョンファイル / `pyproject.toml` / `project.yml` が無い、書き換え対象の記述が無い |
@@ -98,12 +106,14 @@
 | `bump` | - | `none` | `none` / `auto` / `major` / `minor` / `patch` |
 | `version-bump-type` | - | `none` | `npm` / `python` / `pyproject` / `xcodegen` / `json` / `none` |
 | `skip-if-no-changes` | - | `false` | auto の対象 PR が 0 件なら正常終了する（`true` / `false`） |
+| `skip-if-open-release-pr` | - | `false` | 未マージのリリース PR があれば正常終了する |
+| `initial-release` | - | `error` | `error` / `merged-prs`。初回の auto で全マージ済み PR を使うか |
 | `json-version-files` | - | `""` | json の対象ファイルを改行区切りで指定（空白を含むパスも可） |
 | `python-version-file` | - | `src/__version__.py` | `version-bump-type=python` のときのバージョンファイル |
 | `pyproject-path` | - | `pyproject.toml` | `version-bump-type=pyproject` のときの pyproject.toml |
 | `xcodegen-version-file` | - | `project.yml` | `version-bump-type=xcodegen` のときの project.yml |
-| `post-bump-command` | - | `""` | bump 後・commit 前に実行するコマンド（pyproject 向け） |
-| `extra-paths-to-commit` | - | `""` | bump コミットに追加で含めるパス（pyproject 向け） |
+| `post-bump-command` | - | `""` | bump 後・commit 前に実行するコマンド（pyproject / json 向け） |
+| `extra-paths-to-commit` | - | `""` | bump コミットに追加で含めるパス（pyproject / json 向け） |
 | `github-token` | ✓ | - | `contents:write` + `pull-requests:write` 権限の PAT |
 
 ### 出力
@@ -111,9 +121,10 @@
 | 名前 | 説明 |
 | --- | --- |
 | `version` | 実際にリリースするバージョン（bump 指定時は算出結果、スキップ時は空） |
-| `skipped` | 対象 PR がなく正常終了した場合は `true`、それ以外は `false` |
+| `skipped` | 対象 PR がない、または既存リリース PR があり正常終了した場合は `true`、それ以外は `false` |
 | `pr-number` | 作成または更新したリリース PR の番号（スキップ時は空） |
 | `pr-url` | 作成または更新したリリース PR の URL（スキップ時は空） |
+| `head-sha` | 作成・更新したリリース PR の最終コミット SHA（スキップ時は空） |
 
 ### 使用例
 
@@ -156,6 +167,9 @@ jobs:
 すべてのファイルが存在し、単一の JSON オブジェクトのトップレベルに同じ `X.Y.Z` 形式の文字列 `version` を持つ必要がある。
 不正な JSON、version の欠落、不一致はファイルを更新する前にエラーにする。
 更新時は jq で JSON をインデント 2 文字に整形し、指定ファイルをまとめてリリースコミットに含める。
+別の書式が必要なら `post-bump-command` に整形コマンドを指定する。
+JSON の整形後も version の一致を検証し、整形済みファイルを1つのリリースコミットに含めてから PR を作成する。
+追加の生成ファイルは `extra-paths-to-commit` で指定できる。
 package.json の依存関係や lockfile は更新しないため、npm のリポジトリでは従来の `npm` を使う。
 
 ```yaml
@@ -173,7 +187,7 @@ package.json の依存関係や lockfile は更新しないため、npm のリ�
 
 採番規則を共通にし、起動イベントで無変更時の扱いを分ける。
 次の例では日次実行だけが対象 PR のない場合にスキップする。
-初回や breaking change を含むリリースは手動で `version` または bump 種別を指定する。
+初回も自動判定するなら `initial-release: merged-prs` を使い、breaking change では手動で `version` または bump 種別を指定する。
 
 ```yaml
 name: Release
@@ -213,18 +227,55 @@ jobs:
           version: ${{ inputs.version }}
           bump: ${{ inputs.version != '' && 'none' || inputs.bump || 'auto' }}
           skip-if-no-changes: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          skip-if-open-release-pr: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          initial-release: merged-prs
           version-bump-type: npm
           github-token: ${{ secrets.GH_TOKEN }}
 ```
 
-Action 自体は自動マージを設定しない。
-呼び出し側の後続ステップで、`github.event_name == 'schedule' && steps.prepare.outputs.pr-number != ''` の場合だけ、
-返された `pr-number` または `pr-url` の PR に自動マージを設定する。
-手動実行では自動マージを有効にするステップを動かさない。
-呼び出し側でリポジトリの自動マージを有効にし、main の保護ルールで CI を必須チェックに設定する。
-必須チェックがない場合は CI を待たずにマージされることがある。
+`prepare-release` 自体はマージしない。
+呼び出し側で起動イベントに応じて `merge-release` を実行し、返された `pr-number` と `head-sha` を渡す。
+手動実行ではマージ用のステップを動かさない。
 後続の PR / マージイベントのワークフローを起動できる PAT を `GH_TOKEN` に登録する。
 公開には後述の `publish-release` ワークフローも配置する。
+
+## actions/merge-release
+
+指定した PR の head が検証対象の SHA と一致することを確認し、指定 CI の登録・完了とマージ可能な状態を待つ。
+設定した各イベントの最新の実行が成功し、各実行に指定名のジョブが1つあり成功した場合だけ、通常のマージコマンドを実行する。
+古いコミットの成功、チェック未登録、スキップ、キャンセルは成功扱いにしない。
+失敗・API エラー・競合・PR 更新・クローズ・時間切れではマージしない。
+マージ時にも `--match-head-commit` で検証済みの SHA を指定する。
+
+GitHub の自動マージ予約と必須チェックの設定は前提にしない。
+既存のブランチ保護ルールには従い、管理者権限による回避は行わない。
+この Action は checkout せず、runner に Node.js 20 以上と gh が必要。
+ワークフローのジョブの制限時間は、準備時間と `timeout-seconds` を合わせた時間より長くする。
+
+| 入力 | 必須 | 既定値 | 説明 |
+| --- | --- | --- | --- |
+| `pr-number` | ✓ | - | リリース PR の番号 |
+| `head-sha` | ✓ | - | 検証してマージする完全なコミット SHA |
+| `workflow` | - | `ci.yml` | CI のワークフローファイル名または ID |
+| `events` | - | `push` と `pull_request` | 成功を待機するイベントを改行区切りで指定 |
+| `check-name` | - | `checks` | 各 CI 実行で成功を必須にするジョブ名 |
+| `timeout-seconds` | - | `600` | 待機上限、1〜3600秒 |
+| `merge-method` | - | `squash` | `squash` / `merge` / `rebase` |
+| `github-token` | ✓ | - | CI 参照・PR マージ・後続ワークフロー起動が可能な PAT |
+
+```yaml
+- uses: HappyOnigiri/ReleaseActions/actions/merge-release@main
+  if: github.event_name == 'schedule' && steps.prepare.outputs.pr-number != ''
+  with:
+    pr-number: ${{ steps.prepare.outputs.pr-number }}
+    head-sha: ${{ steps.prepare.outputs.head-sha }}
+    workflow: ci.yml
+    events: |
+      push
+      pull_request
+    check-name: checks
+    github-token: ${{ secrets.GH_TOKEN }}
+```
 
 ## actions/publish-release
 

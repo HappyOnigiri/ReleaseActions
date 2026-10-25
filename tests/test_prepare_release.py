@@ -85,16 +85,16 @@ class PrepareReleaseTest(unittest.TestCase):
         return self.outputs.get(expression, "")
 
     def enabled(self, step):
-        for clause in step.get("if", "").split(" && "):
-            if not clause:
-                continue
-            match = re.fullmatch(r"(.+) (==|!=) '(.*)'", clause)
+        def matches(clause):
+            match = re.fullmatch(r"(.+) (==|!=) '(.*)'", clause.strip())
             self.assertIsNotNone(match, clause)
             left, operator, right = match.groups()
             actual = self.resolve("${{ " + left + " }}")
-            if (actual == right) != (operator == "=="):
-                return False
-        return True
+            return (actual == right) == (operator == "==")
+        return all(
+            any(matches(option) for option in clause.strip("()").split(" || "))
+            for clause in step.get("if", "").split(" && ") if clause
+        )
 
     def run_step(self, step):
         env = {**self.env, **{key: self.resolve(value) for key, value in step.get("env", {}).items()}}
@@ -244,10 +244,88 @@ class PrepareReleaseTest(unittest.TestCase):
         self.assertTrue(any(call[:2] == ["pr", "create"] for call in self.state()["calls"]))
 
     def test_invalid_inputs_fail_before_api_calls(self):
-        for values in ({"skip-if-no-changes": "yes"}, {"version-bump-type": "json", "json-version-files": ""}):
+        for values in ({"skip-if-no-changes": "yes"}, {"skip-if-open-release-pr": "yes"}, {"initial-release": "unknown"}, {"version-bump-type": "json", "json-version-files": ""}):
             with self.subTest(values=values):
                 self.inputs.update(values)
                 result = self.run_action()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.state()["calls"], [])
                 self.inputs["skip-if-no-changes"] = "false"
+                self.inputs["skip-if-open-release-pr"] = "false"
+                self.inputs["initial-release"] = "error"
+
+    def test_initial_auto_is_opt_in_and_uses_shared_prefix_rules(self):
+        self.inputs["initial-release"] = "merged-prs"
+        self.use_json()
+        self.state(release_available=False, all_pr_pages=[[
+            {"number": 1, "title": "feat!: closed without merge", "body": "", "merged_at": None},
+            {"number": 2, "title": "fix: bug", "body": "", "merged_at": "2026-09-01T00:00:00Z"},
+        ], [{"number": 3, "title": "feat: feature", "body": "", "merged_at": "2026-09-02T00:00:00Z"}]])
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.output("version"), "1.3.0")
+        self.assertEqual(self.output("head-sha"), self.git("rev-parse", "HEAD").strip())
+
+    def test_initial_auto_retains_breaking_unknown_and_empty_behavior(self):
+        self.inputs["initial-release"] = "merged-prs"
+        self.state(release_available=False)
+        for title, body in (("feat!: change", ""), ("fix: change", "BREAKING CHANGE: change"), ("unknown", "")):
+            self.merged(title, body)
+            self.assertNotEqual(self.run_action().returncode, 0)
+        self.state(merged_prs=[])
+        self.assertNotEqual(self.run_action().returncode, 0)
+        self.inputs["skip-if-no-changes"] = "true"
+        self.assertEqual(self.run_action().returncode, 0)
+        self.assertEqual(self.output("skipped"), "true")
+        self.state(fail_release_list=True)
+        self.assertNotEqual(self.run_action().returncode, 0)
+
+    def test_existing_release_pr_skip_keeps_every_github_write_disabled(self):
+        self.inputs["skip-if-open-release-pr"] = "true"
+        self.state(open_release_prs=[{"head": {"ref": "release/v1.3.0"}}])
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.output("skipped"), "true")
+        self.assertEqual(self.output("head-sha"), "")
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+        self.assertFalse(any(call[:2] in (["pr", "create"], ["pr", "edit"], ["label", "create"]) for call in self.state()["calls"]))
+
+    def test_json_formatter_is_committed_before_the_only_push(self):
+        self.use_json()
+        self.inputs.update({"bump": "minor", "post-bump-command": "printf '\\n' >> 'plugins/display plugin.json'"})
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.git("rev-list", "--count", f"{self.initial}..HEAD").strip(), "1")
+        path = self.paths[1]
+        self.assertTrue(self.git("show", f"origin/release/v1.3.0:{path}").endswith("\n\n"))
+        self.assertEqual(self.output("head-sha"), self.git("rev-parse", "HEAD").strip())
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_json_formatter_failure_does_not_push_or_create_pr(self):
+        self.use_json()
+        self.inputs.update({"bump": "minor", "post-bump-command": "exit 41"})
+        result = self.run_action()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("refs/heads/release/", self.git("ls-remote", "origin"))
+        self.assertFalse(any(call[:2] == ["pr", "create"] for call in self.state()["calls"]))
+
+    def test_json_formatter_cannot_change_the_release_version(self):
+        self.use_json()
+        self.inputs.update({"bump": "minor", "post-bump-command": "printf '{\"version\":\"9.0.0\"}' > 'plugins/display plugin.json'"})
+        self.assertNotEqual(self.run_action().returncode, 0)
+        self.assertNotIn("refs/heads/release/", self.git("ls-remote", "origin"))
+
+    def test_initial_prefixes_use_the_same_minor_and_patch_rules(self):
+        self.inputs["initial-release"] = "merged-prs"
+        self.state(release_available=False)
+        step = next(step for step in MANIFEST["runs"]["steps"] if step.get("id") == "resolve")
+        for prefix in ("fix", "perf", "refactor", "chore", "ci", "docs", "build", "style", "test", "feat"):
+            with self.subTest(prefix=prefix):
+                self.merged(f"{prefix}(scope): change")
+                result = self.run_step(step)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(self.output("version"), "1.3.0" if prefix == "feat" else "1.2.4")
+        self.merged("fix(scope)!: change")
+        self.assertNotEqual(self.run_step(step).returncode, 0)
+        self.state(fail_pr_list=True)
+        self.assertNotEqual(self.run_step(step).returncode, 0)

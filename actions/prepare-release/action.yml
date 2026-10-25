@@ -17,6 +17,14 @@ inputs:
     description: "bump=auto で対象 PR がない場合に正常終了する。明示した version / bump には適用しない"
     required: false
     default: "false"
+  skip-if-open-release-pr:
+    description: "未マージの release/vX.Y.Z PR がある場合に正常終了する"
+    required: false
+    default: "false"
+  initial-release:
+    description: "auto の初回判定: error / merged-prs。merged-prs は main の全マージ済み PR を使う"
+    required: false
+    default: "error"
   json-version-files:
     description: "version-bump-type=json の対象ファイルを改行区切りで指定。各ファイルのトップレベル version を同じ値へ更新する"
     required: false
@@ -33,11 +41,11 @@ inputs:
     required: false
     default: "project.yml"
   post-bump-command:
-    description: "Shell command to run after bump, before commit (e.g. 'make ci'). Designed for pyproject type; skipped when empty."
+    description: "Shell command to run after bump, before commit (e.g. 'make ci'). Used with pyproject or json; skipped when empty."
     required: false
     default: ""
   extra-paths-to-commit:
-    description: "Whitespace/newline-separated additional paths to include in the bump commit. Designed for pyproject type; skipped when empty."
+    description: "Whitespace/newline-separated additional paths to include in the bump commit. Used with pyproject or json; skipped when empty."
     required: false
     default: ""
   github-token:
@@ -48,6 +56,9 @@ outputs:
   version:
     description: "実際にリリースするバージョン (bump 指定時は算出結果)"
     value: ${{ steps.resolve.outputs.version }}
+  head-sha:
+    description: "作成・更新したリリース PR の最終コミット SHA。スキップ時は空"
+    value: ${{ steps.pr.outputs.head-sha }}
   skipped:
     description: "対象 PR がなく正常終了した場合は true、それ以外は false"
     value: ${{ steps.resolve.outputs.skipped }}
@@ -70,6 +81,8 @@ runs:
         BUMP_TYPE: ${{ inputs.version-bump-type }}
         GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
         SKIP_IF_NO_CHANGES: ${{ inputs.skip-if-no-changes }}
+        SKIP_IF_OPEN_RELEASE_PR: ${{ inputs.skip-if-open-release-pr }}
+        INITIAL_RELEASE: ${{ inputs.initial-release }}
         JSON_VERSION_FILES: ${{ inputs.json-version-files }}
       run: |
         set -euo pipefail
@@ -94,6 +107,15 @@ runs:
         case "$SKIP_IF_NO_CHANGES" in
           true|false) ;;
           *) fail "skip-if-no-changes は true または false で指定してください" ;;
+        esac
+
+        case "$SKIP_IF_OPEN_RELEASE_PR" in
+          true|false) ;;
+          *) fail "skip-if-open-release-pr は true または false で指定してください" ;;
+        esac
+        case "$INITIAL_RELEASE" in
+          error|merged-prs) ;;
+          *) fail "initial-release は error または merged-prs で指定してください" ;;
         esac
 
         if [ "$BUMP_TYPE" = "json" ] && ! [[ "$JSON_VERSION_FILES" =~ [^[:space:]] ]]; then
@@ -170,12 +192,24 @@ runs:
         XCODEGEN_VERSION_FILE: ${{ inputs.xcodegen-version-file }}
         JSON_VERSION_FILES: ${{ inputs.json-version-files }}
         SKIP_IF_NO_CHANGES: ${{ inputs.skip-if-no-changes }}
+        SKIP_IF_OPEN_RELEASE_PR: ${{ inputs.skip-if-open-release-pr }}
+        INITIAL_RELEASE: ${{ inputs.initial-release }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
 
         echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+        if [ "$SKIP_IF_OPEN_RELEASE_PR" = "true" ]; then
+          OPEN_RELEASES=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=main&per_page=100" \
+            | jq '[.[][] | select(.head.ref | test("^release/v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | length')
+          if [ "$OPEN_RELEASES" -gt 0 ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "### 未マージのリリース PR があるためスキップしました" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+        fi
 
         # 現在のバージョンは version 明示指定でも後段の重複チェックに使うため常に読む。
         # bump-type が none のリポジトリはバージョンを持つファイルが無いため最新タグを使う。
@@ -214,20 +248,31 @@ runs:
         REASON="bump=${BUMP} の明示指定"
 
         if [ "$BUMP_KIND" = "auto" ]; then
-          LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
-          if [ -z "$LAST_TAG" ]; then
-            fail "GitHub Release が存在しないため auto 判定できません" \
-              "auto は前回リリース以降にマージされた PR のタイトルから種別を決めるため、起点になるリリースが要ります" \
-              "対処: 初回リリースでは version または bump (major / minor / patch) を明示指定してください"
+          if [ "$INITIAL_RELEASE" = "merged-prs" ]; then
+            RELEASE_COUNT=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts \
+              --exclude-pre-releases --limit 1 --json tagName --jq 'length')
+            LAST_TAG=""
+            if [ "$RELEASE_COUNT" -gt 0 ]; then
+              LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+            fi
+          else
+            LAST_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName 2>/dev/null || echo "")
           fi
-          LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
-
-          # 判定対象は前回リリース以降にマージされた PR のタイトル。
-          # changelog の分類 (release-changelog-builder-action) と同じ規約に揃えている。
-          # 自分自身のリリース PR (release: vX.Y.Z) は対象から除外する。
-          PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
-            --search "merged:>=${LAST_DATE}" --limit 200 --json number,title,body \
-            | jq '[.[] | select(.title | test("^release(\\(.+\\))?!?:") | not)]')
+          if [ -z "$LAST_TAG" ]; then
+            if [ "$INITIAL_RELEASE" != "merged-prs" ]; then
+              fail "GitHub Release が存在しないため auto 判定できません" \
+                "対処: version / bump を明示するか、initial-release=merged-prs で全マージ済み PR を判定してください"
+            fi
+            LAST_TAG="初回リリース"
+            PR_JSON=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls?state=closed&base=main&per_page=100" \
+              | jq '[.[][] | select(.merged_at != null) | {number, title, body}]')
+          else
+            LAST_DATE=$(gh release view --repo "$GITHUB_REPOSITORY" --json publishedAt -q .publishedAt)
+            PR_JSON=$(gh pr list --repo "$GITHUB_REPOSITORY" --state merged --base main \
+              --search "merged:>=${LAST_DATE}" --limit 200 --json number,title,body)
+          fi
+          # 初回も通常リリースも同じ prefix 規約で判定し、リリース PR 自体は除外する。
+          PR_JSON=$(echo "$PR_JSON" | jq '[.[] | select(.title | test("^release(\\(.+\\))?!?:") | not)]')
 
           if [ "$(echo "$PR_JSON" | jq 'length')" -eq 0 ]; then
             if [ "$SKIP_IF_NO_CHANGES" = "true" ]; then
@@ -401,7 +446,6 @@ runs:
       run: |
         set -euo pipefail
         bash "${ACTION_PATH}/json-version.sh" bump "$JSON_VERSION_FILES" "$VERSION"
-        git commit -m "release: v${VERSION}"
 
     - name: Version bump (python)
       if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'python'
@@ -517,11 +561,11 @@ runs:
         git commit -m "release: v${VERSION}"
 
     - name: Post-bump command
-      # Designed for pyproject type: runs a shell command after the bump but before
+      # Runs for pyproject and json after the bump but before
       # the commit, e.g. to rebuild artifacts. Skipped when post-bump-command is empty.
       # Security note: post-bump-command is expanded via bash -c. Only trusted
       # callers (internal workflows) should pass this input.
-      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject' && inputs.post-bump-command != ''
+      if: steps.resolve.outputs.skipped != 'true' && (inputs.version-bump-type == 'pyproject' || inputs.version-bump-type == 'json') && inputs.post-bump-command != ''
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -537,10 +581,10 @@ runs:
         fi
 
     - name: Stage extra paths
-      # Designed for pyproject type: stages artifact files generated by post-bump-command
+      # Stages artifact files generated by post-bump-command for pyproject and json
       # (e.g. rebuilt web/js/* files) so they are included in the bump commit.
       # Fails on missing paths to catch typos early.
-      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject' && inputs.extra-paths-to-commit != ''
+      if: steps.resolve.outputs.skipped != 'true' && (inputs.version-bump-type == 'pyproject' || inputs.version-bump-type == 'json') && inputs.extra-paths-to-commit != ''
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -559,19 +603,37 @@ runs:
           fi
         done < <(echo "$EXTRA_PATHS" | tr ' \t' '\n')
 
-    - name: Commit (pyproject)
-      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject'
+    - name: Commit (pyproject / json)
+      if: steps.resolve.outputs.skipped != 'true' && (inputs.version-bump-type == 'pyproject' || inputs.version-bump-type == 'json')
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
         VERSION: ${{ steps.resolve.outputs.version }}
+        BUMP_TYPE: ${{ inputs.version-bump-type }}
+        JSON_VERSION_FILES: ${{ inputs.json-version-files }}
       run: |
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
 
+        if [ "$BUMP_TYPE" = "json" ]; then
+          if ! FINAL_VERSION=$(bash "${ACTION_PATH}/json-version.sh" read "$JSON_VERSION_FILES"); then
+            printf '%s\n' "$FINAL_VERSION"
+            exit 1
+          fi
+          if [ "$FINAL_VERSION" != "$VERSION" ]; then
+            fail "post-bump-command が JSON のリリースバージョンを変更しました" \
+              "対処: version は ${VERSION} のまま維持してください"
+          fi
+          while IFS= read -r path || [ -n "$path" ]; do
+            path="${path%$'\r'}"
+            [ -z "$path" ] && continue
+            git add -- "$path"
+          done <<< "$JSON_VERSION_FILES"
+        fi
+
         if git diff --cached --quiet; then
           fail "コミットする差分がありません" \
-            "pyproject.toml が既に ${VERSION} だったか、想定した書き換えが行われていません" \
+            "バージョンファイルが既に ${VERSION} だったか、想定した書き換えが行われていません" \
             "対処: 未リリースの新しいバージョンを指定してください"
         fi
 
@@ -707,3 +769,4 @@ runs:
         PR_JSON=$(gh pr view "release/v${VERSION}" --json number,url)
         echo "number=$(echo "$PR_JSON" | jq -r '.number')" >> "$GITHUB_OUTPUT"
         echo "url=$(echo "$PR_JSON" | jq -r '.url')" >> "$GITHUB_OUTPUT"
+        echo "head-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
