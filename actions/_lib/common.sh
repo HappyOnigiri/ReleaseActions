@@ -79,6 +79,7 @@ version_source_path() {
     python) echo "$2" ;;
     pyproject) echo "$3" ;;
     xcodegen) echo "$4" ;;
+    json) echo "json-version-files" ;;
     none) echo "最新タグ" ;;
     *) echo "(unknown)" ;;
   esac
