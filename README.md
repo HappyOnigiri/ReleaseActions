@@ -6,7 +6,7 @@
 
 | Action | 役割 | 呼び出し契機 |
 | --- | --- | --- |
-| `actions/prepare-release` | バージョンを決めてリリースブランチと PR を作成 | `workflow_dispatch`（手動） |
+| `actions/prepare-release` | バージョンを決めてリリースブランチと PR を作成 | `workflow_dispatch`（手動）または `schedule` |
 | `actions/publish-release` | タグと GitHub Release を作成し、リリースブランチを削除 | リリース PR のマージ |
 | `actions/release-reminder` | 前回リリース以降のマージ済み PR 数を PR にコメント | main 宛の PR |
 
@@ -47,6 +47,7 @@
 | `python` | `python-version-file` の `__version__` |
 | `pyproject` | `pyproject-path` のトップレベル `version` |
 | `xcodegen` | `xcodegen-version-file` の `MARKETING_VERSION` |
+| `json` | `json-version-files` の各 JSON のトップレベル `version`（全ファイルで一致すること） |
 | `none` | 最新タグ（`vX.Y.Z`） |
 
 ### bump: auto の判定ルール
@@ -56,10 +57,17 @@
 - `feat:` の PR が 1 件でもあれば **minor**
 - それ以外（`fix` / `perf` / `refactor` / `chore` / `ci` / `docs` / `build` / `style` / `test`）のみなら **patch**
 - `feat!:` のような `!` 付き、または本文に `BREAKING CHANGE:` を含む PR を検出した場合は**エラーで停止**する。major は自動では上げず、`bump: major` か `version` の明示指定を求める
-- 対象 PR が 0 件、またはどの prefix にも当たらない場合もエラーで停止する（暗黙の patch にはしない）
+- 対象 PR が 0 件の場合はエラーで停止するが、`skip-if-no-changes: "true"` を指定すると正常終了する
+- どの prefix にも当たらない場合は、スキップ設定にかかわらずエラーで停止する（暗黙の patch にはしない）
 - 自身のリリース PR（`release: vX.Y.Z`）は判定対象から除外する
 
 判定結果と対象 PR は `$GITHUB_STEP_SUMMARY` に出力される。
+
+`skip-if-no-changes` は `bump: auto` の対象 PR が 0 件の場合だけ適用する。
+スキップ時はブランチ・コミット・PR・changelog を作成せず、`skipped` に `true` を返し、`version` と PR の出力は空になる。
+コミットの差分ではなく上記の PR 検索結果で判定するため、main への直接 push は対象に含まない。
+初回リリース、breaking change、API エラー、バージョンファイルの不備は正常終了として扱わない。
+`version` または `bump: major / minor / patch` の明示指定では従来どおりリリースを準備する。
 
 ### 実行前に検出する問題
 
@@ -88,7 +96,9 @@
 | --- | --- | --- | --- |
 | `version` | - | `""` | semver バージョン（例 `1.3.0`）。`bump` と同時指定不可 |
 | `bump` | - | `none` | `none` / `auto` / `major` / `minor` / `patch` |
-| `version-bump-type` | - | `none` | `npm` / `python` / `pyproject` / `xcodegen` / `none` |
+| `version-bump-type` | - | `none` | `npm` / `python` / `pyproject` / `xcodegen` / `json` / `none` |
+| `skip-if-no-changes` | - | `false` | auto の対象 PR が 0 件なら正常終了する（`true` / `false`） |
+| `json-version-files` | - | `""` | json の対象ファイルを改行区切りで指定（空白を含むパスも可） |
 | `python-version-file` | - | `src/__version__.py` | `version-bump-type=python` のときのバージョンファイル |
 | `pyproject-path` | - | `pyproject.toml` | `version-bump-type=pyproject` のときの pyproject.toml |
 | `xcodegen-version-file` | - | `project.yml` | `version-bump-type=xcodegen` のときの project.yml |
@@ -100,7 +110,10 @@
 
 | 名前 | 説明 |
 | --- | --- |
-| `version` | 実際にリリースするバージョン（bump 指定時は算出結果） |
+| `version` | 実際にリリースするバージョン（bump 指定時は算出結果、スキップ時は空） |
+| `skipped` | 対象 PR がなく正常終了した場合は `true`、それ以外は `false` |
+| `pr-number` | 作成または更新したリリース PR の番号（スキップ時は空） |
+| `pr-url` | 作成または更新したリリース PR の URL（スキップ時は空） |
 
 ### 使用例
 
@@ -136,6 +149,82 @@ jobs:
           version-bump-type: npm
           github-token: ${{ secrets.GH_TOKEN }}
 ```
+
+### 複数の JSON バージョンをそろえる
+
+プラグインなどの複数 manifest を同じバージョンでリリースする場合は `json` を指定する。
+すべてのファイルが存在し、単一の JSON オブジェクトのトップレベルに同じ `X.Y.Z` 形式の文字列 `version` を持つ必要がある。
+不正な JSON、version の欠落、不一致はファイルを更新する前にエラーにする。
+更新時は jq で JSON をインデント 2 文字に整形し、指定ファイルをまとめてリリースコミットに含める。
+package.json の依存関係や lockfile は更新しないため、npm のリポジトリでは従来の `npm` を使う。
+
+```yaml
+- uses: HappyOnigiri/ReleaseActions/actions/prepare-release@main
+  with:
+    bump: auto
+    version-bump-type: json
+    json-version-files: |
+      plugins/review/.claude-plugin/plugin.json
+      plugins/display/.claude-plugin/plugin.json
+    github-token: ${{ secrets.GH_TOKEN }}
+```
+
+### 手動リリースと日次リリースの併用
+
+採番規則を共通にし、起動イベントで無変更時の扱いを分ける。
+次の例では日次実行だけが対象 PR のない場合にスキップする。
+初回や breaking change を含むリリースは手動で `version` または bump 種別を指定する。
+
+```yaml
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "リリースするバージョン（空なら bump で判定）"
+        type: string
+        required: false
+      bump:
+        description: "バージョンの上げ方"
+        type: choice
+        default: auto
+        options: [auto, major, minor, patch]
+  schedule:
+    - cron: "17 18 * * *" # 毎日 18:17 UTC
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release-pr: ${{ steps.prepare.outputs.pr-number }}
+    steps:
+      - uses: HappyOnigiri/ReleaseActions/actions/prepare-release@main
+        id: prepare
+        with:
+          version: ${{ inputs.version }}
+          bump: ${{ inputs.version != '' && 'none' || inputs.bump || 'auto' }}
+          skip-if-no-changes: ${{ github.event_name == 'schedule' && 'true' || 'false' }}
+          version-bump-type: npm
+          github-token: ${{ secrets.GH_TOKEN }}
+```
+
+Action 自体は自動マージを設定しない。
+呼び出し側の後続ステップで、`github.event_name == 'schedule' && steps.prepare.outputs.pr-number != ''` の場合だけ、
+返された `pr-number` または `pr-url` の PR に自動マージを設定する。
+手動実行では自動マージを有効にするステップを動かさない。
+呼び出し側でリポジトリの自動マージを有効にし、main の保護ルールで CI を必須チェックに設定する。
+必須チェックがない場合は CI を待たずにマージされることがある。
+後続の PR / マージイベントのワークフローを起動できる PAT を `GH_TOKEN` に登録する。
+公開には後述の `publish-release` ワークフローも配置する。
 
 ## actions/publish-release
 

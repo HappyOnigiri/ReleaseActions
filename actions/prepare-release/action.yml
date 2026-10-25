@@ -11,8 +11,16 @@ inputs:
     required: false
     default: "none"
   version-bump-type:
-    description: "バージョンバンプ方法: npm / python / pyproject / xcodegen / none"
+    description: "バージョンバンプ方法: npm / python / pyproject / xcodegen / json / none"
     default: "none"
+  skip-if-no-changes:
+    description: "bump=auto で対象 PR がない場合に正常終了する。明示した version / bump には適用しない"
+    required: false
+    default: "false"
+  json-version-files:
+    description: "version-bump-type=json の対象ファイルを改行区切りで指定。各ファイルのトップレベル version を同じ値へ更新する"
+    required: false
+    default: ""
   python-version-file:
     description: "Python バージョンファイルパス"
     default: "src/__version__.py"
@@ -40,6 +48,15 @@ outputs:
   version:
     description: "実際にリリースするバージョン (bump 指定時は算出結果)"
     value: ${{ steps.resolve.outputs.version }}
+  skipped:
+    description: "対象 PR がなく正常終了した場合は true、それ以外は false"
+    value: ${{ steps.resolve.outputs.skipped }}
+  pr-number:
+    description: "作成または更新したリリース PR の番号。スキップ時は空"
+    value: ${{ steps.pr.outputs.number }}
+  pr-url:
+    description: "作成または更新したリリース PR の URL。スキップ時は空"
+    value: ${{ steps.pr.outputs.url }}
 
 runs:
   using: "composite"
@@ -52,6 +69,8 @@ runs:
         BUMP: ${{ inputs.bump }}
         BUMP_TYPE: ${{ inputs.version-bump-type }}
         GITHUB_TOKEN_INPUT: ${{ inputs.github-token }}
+        SKIP_IF_NO_CHANGES: ${{ inputs.skip-if-no-changes }}
+        JSON_VERSION_FILES: ${{ inputs.json-version-files }}
       run: |
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
@@ -66,11 +85,21 @@ runs:
         esac
 
         case "$BUMP_TYPE" in
-          npm|python|pyproject|xcodegen|none) ;;
+          npm|python|pyproject|xcodegen|json|none) ;;
           *) fail "version-bump-type の値 '${BUMP_TYPE}' は指定できません" \
-               "指定できるのは npm / python / pyproject / xcodegen / none のいずれかです" \
+               "指定できるのは npm / python / pyproject / xcodegen / json / none のいずれかです" \
                "対処: 呼び出し側ワークフローの version-bump-type 入力を見直してください" ;;
         esac
+
+        case "$SKIP_IF_NO_CHANGES" in
+          true|false) ;;
+          *) fail "skip-if-no-changes は true または false で指定してください" ;;
+        esac
+
+        if [ "$BUMP_TYPE" = "json" ] && ! [[ "$JSON_VERSION_FILES" =~ [^[:space:]] ]]; then
+          fail "json-version-files が空です" \
+            "対処: version-bump-type=json では対象 JSON ファイルを改行区切りで指定してください"
+        fi
 
         if [ -n "$VERSION" ] && [ "$BUMP" != "none" ]; then
           fail "version と bump は同時に指定できません (version=${VERSION}, bump=${BUMP})" \
@@ -139,15 +168,26 @@ runs:
         PYTHON_VERSION_FILE: ${{ inputs.python-version-file }}
         PYPROJECT_PATH: ${{ inputs.pyproject-path }}
         XCODEGEN_VERSION_FILE: ${{ inputs.xcodegen-version-file }}
+        JSON_VERSION_FILES: ${{ inputs.json-version-files }}
+        SKIP_IF_NO_CHANGES: ${{ inputs.skip-if-no-changes }}
         GH_TOKEN: ${{ inputs.github-token }}
       run: |
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
 
+        echo "skipped=false" >> "$GITHUB_OUTPUT"
+
         # 現在のバージョンは version 明示指定でも後段の重複チェックに使うため常に読む。
         # bump-type が none のリポジトリはバージョンを持つファイルが無いため最新タグを使う。
         SOURCE=$(version_source_path "$BUMP_TYPE" "$PYTHON_VERSION_FILE" "$PYPROJECT_PATH" "$XCODEGEN_VERSION_FILE")
-        CURRENT=$(read_current_version "$BUMP_TYPE" "$PYTHON_VERSION_FILE" "$PYPROJECT_PATH" "$XCODEGEN_VERSION_FILE")
+        if [ "$BUMP_TYPE" = "json" ]; then
+          if ! CURRENT=$(bash "${ACTION_PATH}/json-version.sh" read "$JSON_VERSION_FILES"); then
+            printf '%s\n' "$CURRENT"
+            exit 1
+          fi
+        else
+          CURRENT=$(read_current_version "$BUMP_TYPE" "$PYTHON_VERSION_FILE" "$PYPROJECT_PATH" "$XCODEGEN_VERSION_FILE")
+        fi
 
         echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
         echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
@@ -190,6 +230,11 @@ runs:
             | jq '[.[] | select(.title | test("^release(\\(.+\\))?!?:") | not)]')
 
           if [ "$(echo "$PR_JSON" | jq 'length')" -eq 0 ]; then
+            if [ "$SKIP_IF_NO_CHANGES" = "true" ]; then
+              echo "skipped=true" >> "$GITHUB_OUTPUT"
+              echo "### 前回リリース ${LAST_TAG} 以降の対象 PR がないためスキップしました" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             fail "前回リリース ${LAST_TAG} 以降にマージされた PR が無いため auto 判定できません" \
               "リリースする変更がまだ入っていない可能性があります" \
               "対処: 変更をマージしてから再実行するか、version または bump を明示指定してください"
@@ -255,6 +300,7 @@ runs:
         } >> "$GITHUB_STEP_SUMMARY"
 
     - name: Check release version is available
+      if: steps.resolve.outputs.skipped != 'true'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -302,6 +348,7 @@ runs:
         fi
 
     - name: Create release branch
+      if: steps.resolve.outputs.skipped != 'true'
       shell: bash
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
@@ -312,7 +359,7 @@ runs:
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
     - name: Version bump (npm)
-      if: inputs.version-bump-type == 'npm'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'npm'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -344,8 +391,20 @@ runs:
 
         git commit -m "release: v${VERSION}"
 
+    - name: Version bump (json)
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'json'
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        JSON_VERSION_FILES: ${{ inputs.json-version-files }}
+      run: |
+        set -euo pipefail
+        bash "${ACTION_PATH}/json-version.sh" bump "$JSON_VERSION_FILES" "$VERSION"
+        git commit -m "release: v${VERSION}"
+
     - name: Version bump (python)
-      if: inputs.version-bump-type == 'python'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'python'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -384,7 +443,7 @@ runs:
         git commit -m "release: v${VERSION}"
 
     - name: Version bump (pyproject)
-      if: inputs.version-bump-type == 'pyproject'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -419,7 +478,7 @@ runs:
         git add "$PYPROJECT_PATH"
 
     - name: Version bump (xcodegen)
-      if: inputs.version-bump-type == 'xcodegen'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'xcodegen'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -462,7 +521,7 @@ runs:
       # the commit, e.g. to rebuild artifacts. Skipped when post-bump-command is empty.
       # Security note: post-bump-command is expanded via bash -c. Only trusted
       # callers (internal workflows) should pass this input.
-      if: inputs.version-bump-type == 'pyproject' && inputs.post-bump-command != ''
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject' && inputs.post-bump-command != ''
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -481,7 +540,7 @@ runs:
       # Designed for pyproject type: stages artifact files generated by post-bump-command
       # (e.g. rebuilt web/js/* files) so they are included in the bump commit.
       # Fails on missing paths to catch typos early.
-      if: inputs.version-bump-type == 'pyproject' && inputs.extra-paths-to-commit != ''
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject' && inputs.extra-paths-to-commit != ''
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -501,7 +560,7 @@ runs:
         done < <(echo "$EXTRA_PATHS" | tr ' \t' '\n')
 
     - name: Commit (pyproject)
-      if: inputs.version-bump-type == 'pyproject'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'pyproject'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -519,7 +578,7 @@ runs:
         git commit -m "release: v${VERSION}"
 
     - name: Empty commit fallback (no bump)
-      if: inputs.version-bump-type == 'none'
+      if: steps.resolve.outputs.skipped != 'true' && inputs.version-bump-type == 'none'
       shell: bash
       env:
         VERSION: ${{ steps.resolve.outputs.version }}
@@ -528,6 +587,7 @@ runs:
         git commit --allow-empty -m "release: v${VERSION}"
 
     - name: Push release branch
+      if: steps.resolve.outputs.skipped != 'true'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -544,11 +604,13 @@ runs:
         fi
 
     - name: Get previous tag
+      if: steps.resolve.outputs.skipped != 'true'
       id: prev_tag
       shell: bash
       run: echo "tag=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo '')" >> "$GITHUB_OUTPUT"
 
     - name: Build changelog
+      if: steps.resolve.outputs.skipped != 'true'
       id: changelog
       uses: mikepenz/release-changelog-builder-action@v5
       with:
@@ -583,6 +645,7 @@ runs:
         GITHUB_TOKEN: ${{ inputs.github-token }}
 
     - name: Ensure release label exists
+      if: steps.resolve.outputs.skipped != 'true'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -599,6 +662,8 @@ runs:
         fi
 
     - name: Create or update release PR
+      id: pr
+      if: steps.resolve.outputs.skipped != 'true'
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -638,3 +703,7 @@ runs:
           fi
         fi
         rm changelog_body.txt
+
+        PR_JSON=$(gh pr view "release/v${VERSION}" --json number,url)
+        echo "number=$(echo "$PR_JSON" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+        echo "url=$(echo "$PR_JSON" | jq -r '.url')" >> "$GITHUB_OUTPUT"
