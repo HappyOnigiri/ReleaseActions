@@ -19,7 +19,18 @@ def finish(code=0, output=""):
 
 
 if args[:1] == ["api"]:
+    endpoint = next((arg for arg in args if arg.startswith("repos/")), "")
+    if "?state=open" in endpoint:
+        finish(output=json.dumps([state.get("open_release_prs", [])]))
+    if "?state=closed" in endpoint:
+        if state.get("fail_pr_list"):
+            finish(1, "cannot list PRs")
+        finish(output=json.dumps(state.get("all_pr_pages", [[{**pr, "merged_at": "2026-09-01T00:00:00Z"} for pr in state["merged_prs"]]])))
     finish(output='{"permissions":{"push":true}}')
+if args[:2] == ["release", "list"]:
+    if state.get("fail_release_list"):
+        finish(1, "cannot list releases")
+    finish(output="1" if state["release_available"] else "0")
 if args[:2] == ["release", "view"]:
     if not state["release_available"] or args[2].startswith("v"):
         finish(1, "release unavailable")

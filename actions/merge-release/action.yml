@@ -1,0 +1,65 @@
+name: "Merge Release"
+description: "指定コミットの CI 成功を待ち、同じコミットを指定してリリース PR をマージする"
+
+inputs:
+  pr-number:
+    description: "リリース PR の番号"
+    required: true
+  head-sha:
+    description: "検証してマージする完全なコミット SHA"
+    required: true
+  workflow:
+    description: "待機する CI のワークフローファイル名または ID"
+    default: "ci.yml"
+  events:
+    description: "成功を待機する起動イベントを改行区切りで指定"
+    default: |
+      push
+      pull_request
+  check-name:
+    description: "各 CI 実行で成功を必須にするジョブ名"
+    default: "checks"
+  timeout-seconds:
+    description: "待機時間の上限（1〜3600秒）"
+    default: "600"
+  merge-method:
+    description: "squash / merge / rebase"
+    default: "squash"
+  github-token:
+    description: "CI 参照・PR マージ・後続ワークフロー起動が可能な PAT"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Wait for CI and merge the verified commit
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        RELEASE_PR: ${{ inputs.pr-number }}
+        RELEASE_SHA: ${{ inputs.head-sha }}
+        CI_WORKFLOW: ${{ inputs.workflow }}
+        CI_EVENTS: ${{ inputs.events }}
+        CI_CHECK_NAME: ${{ inputs.check-name }}
+        WAIT_TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        MERGE_METHOD: ${{ inputs.merge-method }}
+      run: |
+        set -euo pipefail
+        # shellcheck source=actions/_lib/common.sh
+        source "${ACTION_PATH}/../_lib/common.sh"
+        require_token "$GH_TOKEN" "github-token" "CI 参照と PR マージ"
+        require_commands node gh
+        case "$MERGE_METHOD" in
+          squash|merge|rebase) ;;
+          *) fail "merge-method は squash / merge / rebase で指定してください" ;;
+        esac
+        if ! node "${ACTION_PATH}/wait-checks.mjs" "$RELEASE_PR" "$RELEASE_SHA"; then
+          fail "CI の成功を確認できないためリリース PR をマージしません" \
+            "対処: 実行ログで CI・PR の状態と検証対象コミットを確認してください"
+        fi
+        if ! MERGE_OUTPUT=$(gh pr merge "$RELEASE_PR" --repo "$GH_REPO" "--${MERGE_METHOD}" --match-head-commit "$RELEASE_SHA" 2>&1); then
+          fail "リリース PR のマージに失敗しました" "$MERGE_OUTPUT" \
+            "対処: PR の更新、ブランチ保護ルール、トークンの権限を確認してください"
+        fi
