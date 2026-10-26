@@ -141,10 +141,10 @@ class PublishReleaseTest(unittest.TestCase):
         self.assertEqual(state["latest"], "v1.2.3")
         self.assertTrue(state["branch_deleted"])
         calls = [call for call in state["calls"] if call[0] == "release"]
-        self.assertEqual([call[1] for call in calls], ["view", "create", "upload", "edit"])
+        self.assertEqual([call[1] for call in calls], ["view", "create", "list", "upload", "edit"])
         self.assertIn("--draft", calls[1])
         self.assertIn("--verify-tag", calls[1])
-        self.assertIn("--draft=false", calls[3])
+        self.assertIn("--draft=false", calls[4])
         self.assertEqual(self.git("rev-parse", "refs/tags/v1.2.3").strip(), self.initial)
 
     def test_failed_upload_keeps_draft_and_retry_completes(self):
@@ -280,7 +280,7 @@ class PublishReleaseTest(unittest.TestCase):
         self.assert_success(self.run_action())
         self.assertEqual(self.state()["release"]["notes"], "updated notes\n")
         calls = [c for c in self.state()["calls"] if c[0] == "release"]
-        self.assertEqual([c[1] for c in calls], ["view", "create", "view", "edit"])
+        self.assertEqual([c[1] for c in calls], ["list", "view", "create", "list", "view", "edit"])
         self.assertNotIn("--draft", calls[1])
 
     def test_without_assets_keeps_existing_draft_unpublished(self):
@@ -291,6 +291,37 @@ class PublishReleaseTest(unittest.TestCase):
         self.assertTrue(self.state()["release"]["draft"])
         self.assertEqual(self.state()["latest"], "v1.1.0")
         self.assertEqual(self.state()["release"]["notes"], self.inputs["pr-body"] + "\n")
+
+    def test_publication_supplements_pr_body_from_actual_target_commits(self):
+        self.git("tag", "v1.2.2")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "feat: merged while waiting")
+        target = self.git("rev-parse", "HEAD").strip()
+        self.inputs["target-commit"] = target
+        state = self.state()
+        state.update(previous_tag="v1.2.2", merged_prs=[{
+            "number": 50, "title": "feat: merged while waiting", "merged_at": "2026-09-01T00:00:00Z",
+            "merge_commit_sha": target, "html_url": "https://github.com/example/repo/pull/50",
+        }])
+        self.state_path.write_text(json.dumps(state))
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        notes = self.state()["release"]["notes"]
+        self.assertIn(self.inputs["pr-body"], notes)
+        self.assertIn("feat: merged while waiting", notes)
+        self.assertIn("https://github.com/example/repo/pull/50", notes)
+
+    def test_pr_lookup_failure_keeps_release_unpublished_and_branch_available(self):
+        self.assets()
+        self.env["FAIL_PR_LIST"] = "true"
+        result = self.run_action()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(self.state()["release"]["draft"])
+        self.assertFalse(self.state()["branch_deleted"])
+        del self.env["FAIL_PR_LIST"]
+        self.assets()
+        result = self.run_action()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertFalse(self.state()["release"]["draft"])
 
 
 if __name__ == "__main__":

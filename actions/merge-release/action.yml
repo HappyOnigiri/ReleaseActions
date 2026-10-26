@@ -23,8 +23,8 @@ inputs:
     description: "待機時間の上限（1〜3600秒）"
     default: "600"
   merge-method:
-    description: "squash / merge / rebase"
-    default: "squash"
+    description: "auto / squash / merge / rebase。auto はリポジトリで許可された方式を選ぶ"
+    default: "auto"
   github-token:
     description: "CI 参照・PR マージ・後続ワークフロー起動が可能な PAT"
     required: true
@@ -50,11 +50,21 @@ runs:
         # shellcheck source=actions/_lib/common.sh
         source "${ACTION_PATH}/../_lib/common.sh"
         require_token "$GH_TOKEN" "github-token" "CI 参照と PR マージ"
-        require_commands node gh
+        require_commands node gh jq
         case "$MERGE_METHOD" in
-          squash|merge|rebase) ;;
-          *) fail "merge-method は squash / merge / rebase で指定してください" ;;
+          auto|squash|merge|rebase) ;;
+          *) fail "merge-method は auto / squash / merge / rebase で指定してください" ;;
         esac
+        if [ "$MERGE_METHOD" = "auto" ]; then
+          SETTINGS=$(gh api "repos/${GH_REPO}")
+          # merge commit を優先し、禁止されている方式は選ばない。
+          MERGE_METHOD=$(echo "$SETTINGS" | jq -r '
+            if .allow_merge_commit == true then "merge"
+            elif .allow_squash_merge == true then "squash"
+            elif .allow_rebase_merge == true then "rebase"
+            else empty end')
+          [ -n "$MERGE_METHOD" ] || fail "利用できるマージ方式がありません"
+        fi
         if ! node "${ACTION_PATH}/wait-checks.mjs" "$RELEASE_PR" "$RELEASE_SHA"; then
           fail "CI の成功を確認できないためリリース PR をマージしません" \
             "対処: 実行ログで CI・PR の状態と検証対象コミットを確認してください"

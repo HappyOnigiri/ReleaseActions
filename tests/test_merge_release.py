@@ -36,6 +36,8 @@ if (args[0] === 'pr' && args[1] === 'view') {
   console.log(JSON.stringify({jobs:[{name:process.env.CI_CHECK_NAME,status:'completed',conclusion:'success'}]}));
 } else if (args[0] === 'pr' && args[1] === 'merge') {
   if (!args.includes('--match-head-commit') || args[args.indexOf('--match-head-commit')+1] !== head) process.exit(99);
+} else if (args[0] === 'api') {
+  console.log(process.env.MERGE_PROBE_SETTINGS || JSON.stringify({allow_merge_commit:true}));
 } else process.exit(99);
 ''')
         (self.root / 'gh').chmod(0o755)
@@ -73,6 +75,16 @@ if (args[0] === 'pr' && args[1] === 'view') {
         listing = next(call for call in calls if call[:2] == ['run','list'])
         self.assertEqual(listing[listing.index('--workflow')+1], 'verify.yml')
         self.assertEqual(listing[listing.index('--commit')+1], self.head)
+
+    def test_auto_uses_an_allowed_repository_method(self):
+        for method, settings in (("merge", {"allow_merge_commit": True}),
+                                 ("squash", {"allow_squash_merge": True}),
+                                 ("rebase", {"allow_rebase_merge": True})):
+            with self.subTest(method=method):
+                self.env["MERGE_PROBE_SETTINGS"] = json.dumps(settings)
+                result = self.run_action()
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("--" + method, self.calls()[-1])
 
     def test_failed_ci_and_invalid_api_response_never_reach_merge(self):
         for key in ('MERGE_PROBE_FAILURE', 'MERGE_PROBE_BAD_JSON'):
