@@ -18,7 +18,7 @@ inputs:
     description: "リリース対象の完全なコミット SHA。空なら github.sha"
     default: ""
   github-token:
-    description: "contents:write 権限の PAT"
+    description: "contents:write と pull-requests:read 権限の PAT"
     required: true
 
 runs:
@@ -37,8 +37,8 @@ runs:
         set -euo pipefail
         source "${ACTION_PATH}/../_lib/common.sh"
 
-        require_token "$GITHUB_TOKEN_INPUT" "github-token" "contents:write"
-        require_commands git gh
+        require_token "$GITHUB_TOKEN_INPUT" "github-token" "contents:write と pull-requests:read"
+        require_commands git gh python3
 
         if [ -z "$BRANCH" ]; then
           fail "branch が空です" \

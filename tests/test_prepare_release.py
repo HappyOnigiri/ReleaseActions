@@ -134,12 +134,15 @@ class PrepareReleaseTest(unittest.TestCase):
         self.inputs.update({"version-bump-type": "json", "json-version-files": "\n".join(self.paths)})
 
     def merged(self, title, body=""):
-        self.state(merged_prs=[{"number": 1, "title": title, "body": body}])
+        self.git("commit", "--quiet", "--allow-empty", "-m", title)
+        self.state(merged_prs=[{"number": 1, "title": title, "body": body,
+                               "merge_commit_sha": self.git("rev-parse", "HEAD").strip()}])
 
     def test_no_changes_skips_every_mutating_step_when_enabled(self):
         self.use_json()
         self.inputs["skip-if-no-changes"] = "true"
         self.merged("release: v1.2.3")
+        self.initial = self.git("rev-parse", "HEAD").strip()
         before = {path: (self.repo / path).read_bytes() for path in self.paths}
         refs = self.git("ls-remote", "origin")
         result = self.run_action()
@@ -259,8 +262,8 @@ class PrepareReleaseTest(unittest.TestCase):
         self.use_json()
         self.state(release_available=False, all_pr_pages=[[
             {"number": 1, "title": "feat!: closed without merge", "body": "", "merged_at": None},
-            {"number": 2, "title": "fix: bug", "body": "", "merged_at": "2026-09-01T00:00:00Z"},
-        ], [{"number": 3, "title": "feat: feature", "body": "", "merged_at": "2026-09-02T00:00:00Z"}]])
+            {"number": 2, "title": "fix: bug", "body": "", "merge_commit_sha": self.initial, "merged_at": "2026-09-01T00:00:00Z"},
+        ], [{"number": 3, "title": "feat: feature", "body": "", "merge_commit_sha": self.initial, "merged_at": "2026-09-02T00:00:00Z"}]])
         result = self.run_action()
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(self.output("version"), "1.3.0")
@@ -280,15 +283,53 @@ class PrepareReleaseTest(unittest.TestCase):
         self.state(fail_release_list=True)
         self.assertNotEqual(self.run_action().returncode, 0)
 
-    def test_existing_release_pr_skip_keeps_every_github_write_disabled(self):
+    def test_existing_release_pr_is_rebuilt_and_returned_for_automatic_merge(self):
         self.inputs["skip-if-open-release-pr"] = "true"
-        self.state(open_release_prs=[{"head": {"ref": "release/v1.3.0"}}])
+        self.state(pr_state="OPEN", open_release_prs=[{
+            "head": {"ref": "release/v1.3.0", "repo": {"full_name": "example/repo"}},
+        }])
+        self.git("checkout", "--quiet", "-b", "release/v1.3.0")
+        (self.repo / "stale.txt").write_text("discard this release attempt")
+        self.git("add", "stale.txt")
+        self.git("commit", "--quiet", "-m", "stale release attempt")
+        self.git("push", "origin", "HEAD:refs/heads/release/v1.3.0")
+        self.git("checkout", "--quiet", "main")
+        (self.repo / "feature.txt").write_text("latest main")
+        self.git("add", "feature.txt")
+        self.git("commit", "--quiet", "-m", "feat: latest main")
         result = self.run_action()
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertEqual(self.output("skipped"), "true")
-        self.assertEqual(self.output("head-sha"), "")
-        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
-        self.assertFalse(any(call[:2] in (["pr", "create"], ["pr", "edit"], ["label", "create"]) for call in self.state()["calls"]))
+        self.assertFalse((self.repo / "stale.txt").exists())
+        self.assertEqual(self.git("show", "origin/release/v1.3.0:feature.txt"), "latest main")
+        self.assertEqual(self.output("skipped"), "false")
+        self.assertEqual(self.output("version"), "1.3.0")
+        self.assertEqual(self.output("pr-number"), "42")
+        self.assertNotEqual(self.output("head-sha"), self.initial)
+        self.assertEqual(self.output("head-sha"), self.git("rev-parse", "origin/release/v1.3.0").strip())
+        self.assertTrue(any(call[:3] == ["pr", "edit", "42"] for call in self.state()["calls"]))
+
+    def test_closed_pr_does_not_prevent_recreation_with_or_without_branch(self):
+        self.inputs.update({"version": "1.3.0", "bump": "none"})
+        for branch_exists in (False, True):
+            with self.subTest(branch_exists=branch_exists):
+                self.state(pr_state="CLOSED", calls=[])
+                if branch_exists:
+                    self.git("push", "origin", "HEAD:refs/heads/release/v1.3.0")
+                result = self.run_action()
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertEqual(self.output("pr-number"), "42")
+                self.assertTrue(any(call[:2] == ["pr", "create"] for call in self.state()["calls"]))
+
+    def test_merged_pr_and_history_api_failure_stop_before_branch_overwrite(self):
+        self.inputs.update({"version": "1.3.0", "bump": "none"})
+        self.git("push", "origin", "HEAD:refs/heads/release/v1.3.0")
+        before = self.git("ls-remote", "origin")
+        for values in ({"pr_state": "MERGED"}, {"pr_state": None, "fail_history": True}):
+            self.state(**values)
+            result = self.run_action()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.git("ls-remote", "origin"), before)
+            self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
 
     def test_json_formatter_is_committed_before_the_only_push(self):
         self.use_json()
@@ -329,3 +370,37 @@ class PrepareReleaseTest(unittest.TestCase):
         self.assertNotEqual(self.run_step(step).returncode, 0)
         self.state(fail_pr_list=True)
         self.assertNotEqual(self.run_step(step).returncode, 0)
+
+    def test_features_merged_around_release_merge_are_never_lost_by_publish_time(self):
+        self.git("commit", "--quiet", "--allow-empty", "-m", "fix: prepared")
+        prepared = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "--quiet", "-b", "release/v1.3.0")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "release: v1.3.0")
+        self.git("checkout", "--quiet", "main")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "feat: during release CI")
+        during = self.git("rev-parse", "HEAD").strip()
+        self.git("merge", "--quiet", "--no-ff", "release/v1.3.0", "-m", "release: v1.3.0")
+        released = self.git("rev-parse", "HEAD").strip()
+        self.git("tag", "v1.3.0")
+        self.git("commit", "--quiet", "--allow-empty", "-m", "feat: before publication")
+        after = self.git("rev-parse", "HEAD").strip()
+        prs = [{"number": i, "title": title, "body": "", "merge_commit_sha": sha,
+                "merged_at": "2026-09-01T00:00:00Z", "html_url": f"https://github.com/example/repo/pull/{i}"}
+               for i, (title, sha) in enumerate([
+                   ("fix: prepared", prepared), ("feat: during release CI", during),
+                   ("release: v1.3.0", released), ("feat: before publication", after)], 1)]
+        self.state(merged_prs=prs, latest_tag="v1.3.0")
+        # 公開対象の merge commit からは、準備後に main へ入った feature も見える。
+        result = subprocess.run(["python3", str(ROOT / "actions/_lib/release-prs.py"), "v1.2.3", released],
+                                cwd=self.repo, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([pr["number"] for pr in json.loads(result.stdout)], [1, 2])
+        # 公開日時より前でも、タグに入っていない feature は次の minor 判定に残る。
+        step = next(step for step in MANIFEST["runs"]["steps"] if step.get("id") == "resolve")
+        result = self.run_step(step)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.output("version"), "1.4.0")
+        self.state(merged_prs=prs[:-1])
+        self.inputs["skip-if-no-changes"] = "true"
+        self.assertEqual(self.run_step(step).returncode, 0)
+        self.assertEqual(self.output("skipped"), "true")

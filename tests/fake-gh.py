@@ -18,6 +18,12 @@ def finish(code=0, output=""):
     sys.exit(code)
 
 
+if args[:2] == ["release", "list"]:
+    finish(output=state.get("previous_tag", ""))
+if args[:1] == ["api"] and "--slurp" in args:
+    if os.environ.get("FAIL_PR_LIST"):
+        finish(1, "cannot list PRs")
+    finish(output=json.dumps([state.get("merged_prs", [])]))
 if args[:2] == ["api", "repos/example/repo"]:
     finish(output='{"permissions":{"push":true}}')
 if args[:3] == ["api", "-X", "DELETE"]:

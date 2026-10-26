@@ -26,6 +26,19 @@ if args[:1] == ["api"]:
         if state.get("fail_pr_list"):
             finish(1, "cannot list PRs")
         finish(output=json.dumps(state.get("all_pr_pages", [[{**pr, "merged_at": "2026-09-01T00:00:00Z"} for pr in state["merged_prs"]]])))
+    if endpoint.endswith("/pulls"):
+        if state.get("fail_history"):
+            finish(1, "cannot list history")
+        version = next(arg for arg in args if arg.startswith("head=" )).split(":", 1)[1]
+        history = state.get("history")
+        if history is None:
+            history = [] if state["pr_state"] is None else [{
+                "number": 42, "state": state["pr_state"].lower(),
+                "merged_at": "2026-09-01T00:00:00Z" if state["pr_state"] == "MERGED" else None,
+                "head": {"ref": version, "repo": {"full_name": "example/repo"}},
+                "base": {"ref": "main"},
+            }]
+        finish(output=json.dumps([history]))
     finish(output='{"permissions":{"push":true}}')
 if args[:2] == ["release", "list"]:
     if state.get("fail_release_list"):
@@ -35,7 +48,7 @@ if args[:2] == ["release", "view"]:
     if not state["release_available"] or args[2].startswith("v"):
         finish(1, "release unavailable")
     if "tagName" in args:
-        finish(output="v1.2.3")
+        finish(output=state.get("latest_tag", "v1.2.3"))
     finish(output="2026-09-01T00:00:00Z")
 if args[:2] == ["pr", "list"]:
     if state.get("fail_pr_list"):
