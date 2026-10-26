@@ -53,7 +53,7 @@
 
 ### bump: auto の判定ルール
 
-前回 GitHub Release の `publishedAt` 以降に main へマージされた PR の**タイトル**から判定する。changelog の分類（`release-changelog-builder-action` の `label_extractor`）と同じ規約に揃えてある。
+前回 GitHub Release のタグから、checkout した main までのコミットに含まれるマージ済み PR の**タイトル**から判定する。changelog の分類（`release-changelog-builder-action` の `label_extractor`）と同じ規約に揃えてある。
 
 - `feat:` の PR が 1 件でもあれば **minor**
 - それ以外（`fix` / `perf` / `refactor` / `chore` / `ci` / `docs` / `build` / `style` / `test`）のみなら **patch**
@@ -66,14 +66,18 @@
 公開済み Release がなければ main の全マージ済み PR を取得し、通常リリースと同じ分類処理に渡す。
 既定の `initial-release: error` は従来どおり初回の auto をエラーにする。
 
-`skip-if-open-release-pr: "true"` は、main 宛の未マージの `release/vX.Y.Z` PR があれば正常終了する。
-手動作成の PR を自動運用が引き継がないために使い、通常の手動運用では指定しない。
+`skip-if-open-release-pr: "true"` は、既存の open リリース PR を引き継いで作り直す。
+入力名は互換性のために残しているが、既存 PR をスキップする以前の動作から変更している。
+`bump: auto` で `version` が未指定なら、同じリポジトリの main 宛の `release/vX.Y.Z` PR のバージョンを使う。
+候補が複数なら、`version` と `bump: none` で対象を指定する。
+既存 PR の有無にかかわらず、準備後の PR 番号と SHA を返すため、後続の `merge-release` で自動マージできる。
+自動モードの判定と `merge-release` の呼び出しは、利用側のワークフローで行う。
 
 判定結果と対象 PR は `$GITHUB_STEP_SUMMARY` に出力される。
 
 `skip-if-no-changes` は `bump: auto` の対象 PR が 0 件の場合だけ適用する。
 スキップ時はブランチ・コミット・PR・changelog を作成せず、`skipped` に `true` を返し、`version` と PR の出力は空になる。
-コミットの差分ではなく上記の PR 検索結果で判定するため、main への直接 push は対象に含まない。
+マージ済み PR の `merge_commit_sha` がタグとの差分に含まれるかで判定する。main への直接 push は PR の判定対象に含まない。
 初回の auto が無効な場合、breaking change、API エラー、バージョンファイルの不備は正常終了として扱わない。
 `version` または `bump: major / minor / patch` の明示指定では従来どおりリリースを準備する。
 
@@ -92,11 +96,14 @@
 | バージョン逆行 | 指定バージョンが真実源の現在バージョンより小さい |
 | bump 対象の欠落 | `package.json` / バージョンファイル / `pyproject.toml` / `project.yml` が無い、書き換え対象の記述が無い |
 | コミット対象が空 | バージョン更新後に差分が無い |
-| push / PR 作成の失敗 | ブランチ保護、権限不足、同名バージョンの PR が既に merged / closed |
+| push / PR 作成の失敗 | ブランチ保護、権限不足、同名バージョンの PR が既に merged |
 
 同じバージョンを 2 度リリースしようとした場合は、`npm version` の `Version not changed` ではなく「リリースバージョン X は package.json の現在のバージョンと同じです」と、対処つきで報告する。
 
-なお、ブランチ `release/vX.Y.Z` が既にある場合はエラーにせず、main の内容で作り直して既存の PR を更新する（`::notice::` を出す）。
+なお、ブランチ `release/vX.Y.Z` が既にある場合はエラーにせず、main の内容で作り直し、`--force-with-lease` で push して既存の open PR を番号で更新する。
+closed PR しかない場合は、ブランチの有無にかかわらず新しい PR を作る。過去の PR を Reopen する必要はない。
+merged PR がある場合はブランチを書き換える前に停止する。公開が途中で失敗していれば `publish-release` を再実行する。
+PR の取得に失敗した場合も、新規 PR がない状態とはみなさず、ブランチの変更前に停止する。
 
 ### 入力
 
@@ -106,7 +113,7 @@
 | `bump` | - | `none` | `none` / `auto` / `major` / `minor` / `patch` |
 | `version-bump-type` | - | `none` | `npm` / `python` / `pyproject` / `xcodegen` / `json` / `none` |
 | `skip-if-no-changes` | - | `false` | auto の対象 PR が 0 件なら正常終了する（`true` / `false`） |
-| `skip-if-open-release-pr` | - | `false` | 未マージのリリース PR があれば正常終了する |
+| `skip-if-open-release-pr` | - | `false` | 既存の open リリース PR のバージョンで再開する（互換用の入力名） |
 | `initial-release` | - | `error` | `error` / `merged-prs`。初回の auto で全マージ済み PR を使うか |
 | `json-version-files` | - | `""` | json の対象ファイルを改行区切りで指定（空白を含むパスも可） |
 | `python-version-file` | - | `src/__version__.py` | `version-bump-type=python` のときのバージョンファイル |
@@ -249,7 +256,7 @@ jobs:
 
 GitHub の自動マージ予約と必須チェックの設定は前提にしない。
 既存のブランチ保護ルールには従い、管理者権限による回避は行わない。
-この Action は checkout せず、runner に Node.js 20 以上と gh が必要。
+この Action は checkout せず、runner に Node.js 20 以上、gh、jq が必要。
 ワークフローのジョブの制限時間は、準備時間と `timeout-seconds` を合わせた時間より長くする。
 
 | 入力 | 必須 | 既定値 | 説明 |
@@ -260,7 +267,7 @@ GitHub の自動マージ予約と必須チェックの設定は前提にしな�
 | `events` | - | `push` と `pull_request` | 成功を待機するイベントを改行区切りで指定 |
 | `check-name` | - | `checks` | 各 CI 実行で成功を必須にするジョブ名 |
 | `timeout-seconds` | - | `600` | 待機上限、1〜3600秒 |
-| `merge-method` | - | `squash` | `squash` / `merge` / `rebase` |
+| `merge-method` | - | `auto` | `auto` / `squash` / `merge` / `rebase`。auto は許可された方式を merge → squash → rebase の順に選ぶ |
 | `github-token` | ✓ | - | CI 参照・PR マージ・後続ワークフロー起動が可能な PAT |
 
 ```yaml
@@ -277,7 +284,25 @@ GitHub の自動マージ予約と必須チェックの設定は前提にしな�
     github-token: ${{ secrets.GH_TOKEN }}
 ```
 
+### リリース準備中に別の PR がマージされた場合
+
+merge commit 方式では、リリース PR の作成後に main に入った変更も、リリースのマージコミットに含まれる。
+公開対象は `target-commit` にそのマージコミットを指定する。
+公開時に、前回の公開済み Release のタグと対象コミットの差分から PR 一覧を取得し、渡された `pr-body` の末尾へ追記する。
+準備時点の PR 本文にない変更も、公開するノートで確認できる。
+
+```text
+リリース準備 → feature A のマージ → リリースのマージ → feature B のマージ → 公開
+                今回のコードとノートに含む           次回の auto 判定に残る
+```
+
+次回の auto 判定は公開日時を使わないため、feature B が公開前にマージされても取りこぼさない。
+rebase 方式では PR の `merge_commit_sha` がリリース履歴の祖先に残る運用が前提になる。
+履歴の書き換えや cherry-pick による取り込みは、この PR 単位の判定では追跡しない。
+
 ## actions/publish-release
+
+PR 一覧の取得に Python 3 と pull-requests:read 権限も必要。ノートの取得に失敗した場合は公開せず、再実行で復帰できる。
 
 マージされた `release/vX.Y.Z` ブランチからバージョンを取り出し、タグと GitHub Release を作成してブランチを削除する。
 
@@ -288,7 +313,7 @@ GitHub の自動マージ予約と必須チェックの設定は前提にしな�
 | `update-major-tag` | - | `false` | `v1` のようなメジャータグを更新するか |
 | `assets` | - | `""` | 添付するファイルのパスを改行区切りで指定（glob 不可） |
 | `target-commit` | - | `github.sha` | リリース対象の完全なコミット SHA |
-| `github-token` | ✓ | - | `contents:write` 権限の PAT |
+| `github-token` | ✓ | - | `contents:write` + `pull-requests:read` 権限の PAT |
 
 トークン未設定・無効、`branch` が `release/vX.Y.Z` 形式でない、`update-major-tag` が `true` / `false` 以外、タグ push・Release 作成・ブランチ削除の失敗を、それぞれ対処つきで報告する。タグや Release が既にある場合は再実行とみなして続行する。ブランチ削除だけが失敗した場合は、タグと Release の作成が完了していることをメッセージに含める。
 
@@ -335,7 +360,7 @@ jobs:
           github-token: ${{ secrets.GH_TOKEN }}
 ```
 
-呼び出し元は `pull_request` の `closed` イベントを購読し、`contents: write` 権限を設定する。
+呼び出し元は `pull_request` の `closed` イベントを購読し、`contents: write` と `pull-requests: read` 権限を設定する。
 インストーラーを配る場合、呼び出し側のビルドでタグを埋め込み、同じタグのバイナリを取得させる。
 README は `releases/latest/download/install.sh` を固定で案内でき、バージョン更新のためのコミットは不要になる。
 
